@@ -44,6 +44,13 @@ def _legend(ax, ncol=2):
               edgecolor=BASELINE)
 
 
+def _plain_log(ax) -> None:
+    """對數軸改用純數字刻度（JhengHei 的 mathtext 缺 U+2212，10⁻¹ 會變豆腐字）。"""
+    from matplotlib.ticker import FuncFormatter, LogLocator
+    ax.yaxis.set_major_locator(LogLocator(base=10))
+    ax.yaxis.set_major_formatter(FuncFormatter(lambda v, _: f"{v:g}"))
+
+
 def equity_overlay_fig(dates: pd.DatetimeIndex, curves: dict[str, np.ndarray],
                        market_label: str, path) -> None:
     """自始以來資金曲線疊圖：上=線性、下=對數。"""
@@ -60,6 +67,7 @@ def equity_overlay_fig(dates: pd.DatetimeIndex, curves: dict[str, np.ndarray],
     axes[0].set_ylabel("權益（線性）")
     axes[1].set_yscale("log")
     axes[1].set_ylabel("權益（對數）")
+    _plain_log(axes[1])
     _legend(axes[0])
     fig.tight_layout()
     fig.savefig(path)
@@ -81,6 +89,7 @@ def nikkei_lev_fig(paths: dict, path_out) -> None:
                      label=STRATEGY_LABEL[name])
     axes[0].set_yscale("log")
     axes[0].set_ylabel("權益（對數，期初=1）")
+    _plain_log(axes[0])
     axes[0].set_title("日經 225・1990–2003 長陰跌：權益與槓桿路徑",
                       fontsize=11, color=INK)
     axes[1].axhline(2.0, color=BASELINE, lw=0.8, ls="--")

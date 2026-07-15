@@ -11,6 +11,18 @@ conda run -n ML_env python run.py        # 全流程約 90 秒
 conda run -n ML_env python test_engine.py  # 引擎手算對照 sanity check
 ```
 
+## 第三輪：條件式曝險・跨市場（branch `round3-conditional-exposure`）
+
+`round3/` 子套件——條件式曝險策略（vol targeting／趨勢過濾／CPPI／混合）×
+四市場（TX 期貨、S&P 500、日經 225、恆生）× stationary bootstrap 合成路徑，
+含槓桿中性化校準協定（σ_target walk-forward + 全樣本雙軌）。
+主報告 `round3/output/report.md`。
+
+```bash
+conda run -n ML_env python -m round3.run3         # 全流程（含 1,000 條 bootstrap）
+conda run -n ML_env python -m round3.test_engine  # 引擎手算對照＋與前輪引擎互驗
+```
+
 ## 模組
 
 | 檔案 | 內容 |
