@@ -18,6 +18,7 @@ from d10_trading import config
 from d10_trading.execution import orders
 from d10_trading.execution.broker import ShioajiBroker
 from d10_trading.ops import notify
+from d10_trading.ops.audit import audit
 
 
 def main(argv=None) -> int:
@@ -35,6 +36,7 @@ def main(argv=None) -> int:
     notify.setup_logging()
     broker = ShioajiBroker()
     broker.login()
+    audit("tool_start", tool="flatten_sim")
     try:
         positions = broker.positions()
         if not positions:

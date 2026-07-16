@@ -23,6 +23,7 @@ import time
 from d10_trading import config
 from d10_trading.execution.broker import ShioajiBroker
 from d10_trading.ops import notify
+from d10_trading.ops.audit import audit
 
 
 def main(argv=None) -> int:
@@ -42,6 +43,7 @@ def main(argv=None) -> int:
     notify.setup_logging()
     broker = ShioajiBroker()
     broker.login()
+    audit("tool_start", tool="validate_live_path")
     try:
         import datetime as dt
         today = dt.date.today()

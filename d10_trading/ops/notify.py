@@ -14,6 +14,7 @@ import logging
 import requests
 
 from d10_trading import config
+from d10_trading.ops.audit import audit
 
 log = logging.getLogger("d10.notify")
 
@@ -36,6 +37,7 @@ def _telegram(text: str) -> bool:
 
 
 def send(level: str, text: str) -> None:
+    audit("notify", level=level, text=text)
     tag = _PREFIX.get(level, "")
     body = f"{tag} [D_10] {text}"
     if level in ("ALERT", "CRITICAL"):

@@ -17,6 +17,7 @@ from dataclasses import dataclass, field
 
 from d10_trading import config
 from d10_trading.execution.broker import BrokerInterface, OrderHandle, Quote
+from d10_trading.ops.audit import audit
 
 log = logging.getLogger("d10.orders")
 
@@ -107,6 +108,9 @@ def execute_limit(broker: BrokerInterface, code: str, action: str,
         st = broker.refresh(handle)
 
     filled = st.deal_quantity
+    audit("order_final", code=code, action=action, status=st.status,
+          filled=filled, requested=quantity, avg_price=st.avg_fill_price,
+          order_price=handle.price)
     if filled > 0:
         rep.fills.append(Fill(code=code, action=action, quantity=filled,
                               requested=quantity, price=st.avg_fill_price,
@@ -190,6 +194,9 @@ def _roll_via_combo(broker: BrokerInterface, near_code: str, next_code: str,
                 broker.cancel(handle)
                 st = broker.refresh(handle)
     filled = st.deal_quantity
+    audit("order_final", code=f"{near_code}->{next_code}", action="Roll",
+          status=st.status, filled=filled, requested=qty,
+          avg_price=st.avg_fill_price, order_price=handle.price)
     if filled > 0:
         rep.fills.append(Fill(code=f"{near_code}->{next_code}", action="Roll",
                               quantity=filled, requested=qty,

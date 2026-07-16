@@ -24,6 +24,7 @@ from d10_trading.data.series import DataStaleError, prepare_series
 from d10_trading.execution import orders
 from d10_trading.execution.broker import BrokerInterface, ShioajiBroker
 from d10_trading.ops import notify, oplog, reconcile as rc, state as state_mod
+from d10_trading.ops.audit import audit
 from d10_trading.ops.state import PositionState
 from d10_trading.strategy import regime, sizing
 from d10_trading.strategy.rollover import decide_roll
@@ -58,6 +59,7 @@ def run_daily(broker: BrokerInterface, *, today: dt.date | None = None,
     # ── 0. 斷電開關 ─────────────────────────────────────────────────────────
     if config.KILL_SWITCH_FILE.exists():
         log.warning("KILL_SWITCH 存在，程式退出（不做任何事）")
+        audit("kill_switch_exit")
         return 0
 
     # ── 交易日與冪等 ────────────────────────────────────────────────────────
@@ -74,6 +76,8 @@ def run_daily(broker: BrokerInterface, *, today: dt.date | None = None,
         log.info("本日已執行（executed_date=%s），冪等退出", st.executed_date)
         return 0
     st.last_run = now.isoformat(timespec="seconds")
+    audit("batch_start", today=today.isoformat(), dry_run=dry_run,
+          ignore_window=ignore_window)
 
     warnings: list[str] = []
     try:
@@ -81,12 +85,14 @@ def run_daily(broker: BrokerInterface, *, today: dt.date | None = None,
                          fetch_kwargs, sleep_fn, warnings)
     except DayStop as e:
         notify.send(e.level, f"{today} 本日停止：{e}")
+        audit("batch_stop", reason=str(e), level=e.level, exit_code=e.code)
         st.notes = f"{today} 停止：{e}"
         state_mod.save(st)
         return e.code
     except Exception as e:  # noqa: BLE001 - 未預期異常一律告警停止
         log.exception("未預期異常")
         notify.send("ALERT", f"{today} 未預期異常：{type(e).__name__}: {e}")
+        audit("batch_error", error=f"{type(e).__name__}: {e}", exit_code=1)
         return 1
 
 
@@ -122,6 +128,8 @@ def _run_core(broker: BrokerInterface, st, today, now, dry_run, ignore_window,
             l_cur = sizing.current_leverage(held_qty, px_now, recon.equity)
             if sizing.fuse_triggered(l_cur):
                 fuse_mode = True
+                audit("fuse_triggered", l_current=round(l_cur, 3),
+                      held_qty=held_qty, equity=recon.equity)
                 notify.send("CRITICAL",
                             f"保險絲觸發：L_current={l_cur:.2f} ≥ {config.FUSE_L}，"
                             "將立即減碼回 L_target")
@@ -222,6 +230,13 @@ def _run_core(broker: BrokerInterface, st, today, now, dry_run, ignore_window,
                  sz.target_contracts, sz.raw_contracts, sz.rounding_residual,
                  held_qty, spread,
                  f"；轉倉（{roll.reason}）" if roll.should_roll else "")
+        audit("decision", regime=cur_regime, exec_leverage=l_exec,
+              signal_date=sig_date.isoformat(), equity=round(recon.equity),
+              price=target_q_obj.price, target=sz.target_contracts,
+              raw_contracts=round(sz.raw_contracts, 4), held=held_qty,
+              delta=delta, roll=roll.reason if roll.should_roll else "",
+              spread=round(spread, 1), preview=preview,
+              target_code=target_c.code)
 
         # ── 5. 下單執行 ────────────────────────────────────────────────────
         action_desc = "無動作"
@@ -299,11 +314,13 @@ def _run_core(broker: BrokerInterface, st, today, now, dry_run, ignore_window,
                     f"{recon.equity:,.0f}｜{held_qty}→{held_after} 口"
                     f"（目標 {sz.target_contracts}）｜{action_desc}"
                     + (f"｜⚠️ {len(warnings)} 則警示" if warnings else ""))
-        if need_trade and not dry_run and not rep.ok:
-            return 1
-        if fuse_mode:
-            return 2
-        return 0
+        exit_code = (1 if (need_trade and not dry_run and not rep.ok)
+                     else 2 if fuse_mode else 0)
+        audit("batch_end", action=action_desc, held_before=held_qty,
+              held_after=held_after, target=sz.target_contracts,
+              orders_ok=rep.ok, fuse=fuse_mode, dry_run=dry_run,
+              warnings=len(warnings), exit_code=exit_code)
+        return exit_code
     finally:
         broker.logout()
 
@@ -328,6 +345,8 @@ def _fuse_emergency(broker, st, recon, today, sleep_fn, why: str) -> int:
     notify.send("CRITICAL",
                 f"資料過期（{why}）且保險絲觸發——以最後訊號 L={l_target} 緊急減碼："
                 f"{recon.total_qty} → {sz.target_contracts} 口")
+    audit("fuse_emergency", reason=why, l_target=l_target,
+          held=recon.total_qty, target=sz.target_contracts)
     if delta < 0:
         rep = orders.execute_limit(broker, held_code, "Sell", -delta,
                                    sleep_fn=sleep_fn)
@@ -382,6 +401,9 @@ def main(argv=None) -> int:
             st = rc.adopt(broker, state_mod.load(),
                           lambda code: month_map.get(code, "??????"))
             state_mod.save(st)
+            audit("adopt_state",
+                  positions=[(p.code, p.qty) for p in st.positions],
+                  equity=st.equity)
             log.info("adopt-state 完成：%s", [(p.code, p.qty) for p in st.positions])
             return 0
         finally:

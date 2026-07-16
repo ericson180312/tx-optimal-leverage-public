@@ -30,11 +30,12 @@ d10_trading/
 │   ├── broker.py        Shioaji 唯一封裝層（查詢 retry、下單不盲重試）
 │   └── orders.py        限價單流程（讓 2 檔 → 90s 改價一次 → 撤單告警）、轉倉
 ├── ops/
-│   ├── state.py         狀態檔 d10_trading/var/state.json（原子寫入）
+│   ├── audit.py         操作稽核軌跡 var/logs/audit.jsonl（見 §2.1）
+│   ├── state.py         狀態檔 var/state.json（原子寫入）
 │   ├── reconcile.py     開場對帳（不一致 → 告警停止，絕不自動修正）
 │   ├── notify.py        Telegram + 日誌
 │   └── oplog.py         每日摘要 CSV / 成交 JSONL / 執行價 vs 收盤價稽核
-├── tests/             53 項測試（單元 + 黃金 + 整合情境）
+├── tests/             66 項測試（單元 + 黃金 + 整合 + 稽核）
 ├── .env.example       環境變數樣板（複製為 .env，永不提交）
 └── var/               執行期產物（狀態/快取/日誌，gitignored）
 ```
@@ -57,6 +58,24 @@ d10_trading/
 10. **落地**：讀回 API 實際部位寫入狀態、每日摘要、Telegram 推播。
 
 退出碼：`0` 正常、`1` 告警停止、`2` 保險絲/嚴重。
+
+### 2.1 紀錄檔案總覽（`var/logs/`，全部保留、不輪刪）
+
+| 檔案 | 內容 |
+|---|---|
+| **audit.jsonl** | 🔴 **操作稽核軌跡**（G1/G2′/G3 全階段統一留痕）：批次生命週期（start/decision/end/stop）、每筆委託/組合單/改價/撤單與終態、所有通知告警原文、手動工具（adopt-state / flatten_sim / validate_live_path）、保險絲、斷電開關。掛在 broker 封裝層與批次編排器兩個「繞不過去的漏斗」上，任何呼叫端都無從遺漏。每行一個 JSON 事件（ts=台北時間、mode=sim/live、event、其餘依事件） |
+| live_YYYYMM.log | 完整程式日誌（月檔） |
+| daily_summary.csv | 每日一行摘要（regime/權益/口數/動作/警示） |
+| trades.jsonl | 成交明細 |
+| exec_vs_close.csv | 執行價 vs 官方收盤價偏差（次日補寫，規格 §2） |
+| scheduler.log | 排程器輸出（run_daily.bat 導向） |
+
+稽核查詢範例（PowerShell）：
+```powershell
+Get-Content d10_trading\var\logs\audit.jsonl | Select-String '"event": "order_'   # 所有委託事件
+Get-Content d10_trading\var\logs\audit.jsonl | Select-String '"mode": "live"'    # 只看真實模式
+Get-Content d10_trading\var\logs\audit.jsonl -Tail 20                            # 最近 20 筆
+```
 
 ## 3. 部署步驟
 
@@ -109,7 +128,7 @@ Unregister-ScheduledTask D10_daily -Confirm:$false     # 移除排程
 python -m d10_trading.main --dry-run                 # 完整流程但不下單、不落地
 python -m d10_trading.main --ignore-window           # 略過 13:05–13:40 時窗（測試用）
 python -m d10_trading.main --adopt-state             # 人工確認後以 API 部位重置狀態
-python -m pytest d10_trading/tests -q                # 53 項測試（含黃金測試）
+python -m pytest d10_trading/tests -q                # 66 項測試（含黃金測試）
 ```
 
 ## 4. 上線閘門檢核清單（🔴 每關需要使用者明確說「通過」）

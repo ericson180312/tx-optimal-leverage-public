@@ -14,6 +14,7 @@ import time
 from dataclasses import dataclass, field
 
 from d10_trading import config
+from d10_trading.ops.audit import audit
 
 log = logging.getLogger("d10.broker")
 
@@ -154,6 +155,7 @@ class ShioajiBroker(BrokerInterface):
         if self._api.futopt_account is None:
             raise BrokerError("登入成功但無期貨帳戶")
         log.info("Shioaji 登入完成（simulation=%s）", self.simulation)
+        audit("broker_login", simulation=self.simulation)
 
     def logout(self) -> None:
         if self._api is not None:
@@ -326,6 +328,8 @@ class ShioajiBroker(BrokerInterface):
             order_type=sj.OrderType.ROD,
             octype=sj.FuturesOCType.Auto,
             account=self._api.futopt_account)
+        audit("order_submit", code=code, action=action, quantity=quantity,
+              price=price)
         trade = self._api.place_order(self._contract_obj(code), order)
         return OrderHandle(code=code, action=action, quantity=quantity,
                            price=price, raw=trade)
@@ -344,6 +348,8 @@ class ShioajiBroker(BrokerInterface):
             order_type=sj.OrderType.ROD,            # 期貨跨月價差可用 ROD
             octype=sj.FuturesOCType.Auto,
             account=self._api.futopt_account)
+        audit("order_submit_combo", sell=sell_code, buy=buy_code,
+              quantity=quantity, net_price=net_price)
         trade = self._api.place_comboorder(combo, order)
         return OrderHandle(code=f"{sell_code}->{buy_code}", action="Roll",
                            quantity=quantity, price=net_price, raw=trade,
@@ -352,10 +358,13 @@ class ShioajiBroker(BrokerInterface):
     def update_price(self, handle: OrderHandle, price: float) -> None:
         if handle.is_combo:
             raise BrokerError("組合單不支援改價，請撤單重下")
+        audit("order_reprice", code=handle.code, old_price=handle.price,
+              new_price=price)
         self._api.update_order(trade=handle.raw, price=price)
         handle.price = price
 
     def cancel(self, handle: OrderHandle) -> None:
+        audit("order_cancel", code=handle.code, quantity=handle.quantity)
         if handle.is_combo:
             self._api.cancel_comboorder(handle.raw)
         else:
