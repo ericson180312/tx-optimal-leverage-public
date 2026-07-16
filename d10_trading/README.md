@@ -114,14 +114,35 @@ python -m pytest d10_trading/tests -q                # 53 項測試（含黃金�
 
 ## 4. 上線閘門檢核清單（🔴 每關需要使用者明確說「通過」）
 
+> 2026-07-16 與使用者確認修訂：原 G2「真實 1 口」假設從空手開始，不適用於
+> 真倉已持有滿額部位（3 口 TMF 202608）的現況——改為 G2′「不成交驗證＋
+> 接管監管期」。風險遞進：模擬轉倉 → 零成交風險的真實委託路徑 → 監管下
+> 日常運作 → 監管下真實轉倉 → 無人值守。
+
 | 閘門 | 模式 | 通過條件 | 檢核 |
 |---|---|---|---|
-| **G0** 開發 | 離線 | 53 項測試全綠；黃金測試與第三輪回測逐日一致 | `pytest d10_trading/tests -q`；審閱 §8「規格判斷紀錄」 |
-| **G1** 模擬 | `LIVE_TRADING=False`（現值） | 模擬環境連跑 **10 個交易日**：每日摘要正確、無誤動作、至少一次模擬轉倉（可用 `SIM_EQUITY` 調整口數觸發） | 前置：`python -m d10_trading.scripts.flatten_sim --yes` 清掉 API 開通測試殘留的模擬部位；核對 `var/logs/daily_summary.csv` 逐日；轉倉日觀察價差單/兩腳行為 |
-| **G2** 真實 1 口 | `LIVE_TRADING=True`＋`MAX_CONTRACTS=1`＋CA | **20 個交易日**：成交回報/對帳/滑價正常；`exec_vs_close.csv` 偏差在預期內 | 每日核對 Telegram 摘要與對帳單 |
-| **G3** 真實全額 | `MAX_CONTRACTS` 依資金重算 | — | — |
+| **G0** 開發 | 離線 | 60 項測試全綠；黃金測試與第三輪回測逐日一致 | `pytest d10_trading/tests -q`；審閱 §8「規格判斷紀錄」 |
+| **G1** 模擬（延長版） | `LIVE_TRADING=False`（現值） | 模擬環境自 2026-07-17 連跑至 **8/12 含模擬轉倉演練**（自然轉倉日；約 19 個交易日）：每日摘要正確、無誤動作、轉倉正確執行。期間真倉由使用者自管，**8→9 月真實轉倉最後一次手動執行** | 前置：`flatten_sim --yes` 清掉模擬殘留部位；核對 `var/logs/daily_summary.csv` 逐日；8/12 觀察價差單/兩腳行為 |
+| **G2′** 真實・接管監管期 | `LIVE_TRADING=True`＋CA＋`MAX_CONTRACTS=4` | ① 不成交驗證通過（見下）② 接管後 **20+ 交易日**對帳/成交/滑價全程乾淨 ③ 含 **9/9 前後**系統執行的第一次真實轉倉（人在螢幕前監看） | 每日核對 Telegram 摘要 vs 券商 App；`exec_vs_close.csv` 偏差在預期內 |
+| **G3** 真實全額・無人值守 | 同 G2′ 設定 | — | — |
 
 G0→G3 程式碼相同，只改 `config.py` 設定（`LIVE_TRADING`、`MAX_CONTRACTS`、`SIM_EQUITY`）。
+
+### 4.1 G2′ 接管程序（依序執行）
+
+1. **確認真倉帳戶只有 TMF 部位**——對帳不容忍其他商品（選擇權、其他期貨
+   會觸發告警停止），有的話先人工隔離/處理。
+2. `config.py` 改 `LIVE_TRADING = True`（`.env` 需已設 SJ_CA_PATH/SJ_CA_PASSWD）。
+3. **不成交驗證**（盤中執行；驗證 CA 簽章/下單/回報/撤單的正式環境全路徑，
+   掛遠價限價買單 1 口、零成交風險，確認回報後即撤單）：
+   ```
+   python -m d10_trading.scripts.validate_live_path --yes
+   ```
+4. `python -m d10_trading.main --adopt-state` 接管現有部位。
+5. **預覽第一天動作**：`python -m d10_trading.main --dry-run --ignore-window`。
+   權益數此時改用真實 API 值——確認目標口數與預期一致（權益 ≈<equity>時
+   目標 3 口＝現有部位，接管日應無交易）再讓排程接手。
+6. 改動 commit 並打 tag（`g2-takeover`），推送遠端。
 
 ## 5. 故障排除
 
