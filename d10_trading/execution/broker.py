@@ -89,6 +89,10 @@ class BrokerInterface:
                           date: dt.date) -> float | None: raise NotImplementedError
     def equity(self) -> float: raise NotImplementedError
     def positions(self) -> list[PositionInfo]: raise NotImplementedError
+    def ca_expiry_days(self) -> int | None:
+        """CA 憑證剩餘天數；不可用（模擬/未設 person_id/查詢失敗）回 None。"""
+        return None
+
     def place_limit(self, code: str, action: str, quantity: int,
                     price: float) -> OrderHandle: raise NotImplementedError
     def place_combo_roll(self, sell_code: str, buy_code: str, quantity: int,
@@ -316,6 +320,37 @@ class ShioajiBroker(BrokerInterface):
                     last_price=float(getattr(p, "last_price", 0.0) or 0.0)))
             return out
         return _retry(_do, "持倉查詢")
+
+    def ca_expiry_days(self) -> int | None:
+        """CA 憑證剩餘天數（get_ca_expiretime；到期預警用，失敗回 None）。"""
+        if self.simulation or not config.SJ_PERSON_ID:
+            return None
+        try:
+            exp = self._api.get_ca_expiretime(config.SJ_PERSON_ID)
+            d = self._to_datetime(exp)
+            if d is None:
+                log.warning("CA 到期時間格式無法解析：%r", exp)
+                return None
+            return (d.date() - dt.date.today()).days
+        except Exception as e:  # noqa: BLE001 - 預警功能失敗不影響批次
+            log.warning("CA 到期查詢失敗：%s", type(e).__name__)
+            return None
+
+    @staticmethod
+    def _to_datetime(v) -> dt.datetime | None:
+        if isinstance(v, dt.datetime):
+            return v
+        s = str(v or "").strip()
+        for fmt in ("%Y-%m-%d %H:%M:%S", "%Y/%m/%d %H:%M:%S",
+                    "%Y-%m-%d", "%Y/%m/%d", "%Y%m%d%H%M%S", "%Y%m%d"):
+            try:
+                return dt.datetime.strptime(s, fmt)
+            except ValueError:
+                continue
+        try:
+            return dt.datetime.fromisoformat(s)
+        except ValueError:
+            return None
 
     # ── 下單（不重試）────────────────────────────────────────────────────────
     def place_limit(self, code: str, action: str, quantity: int,

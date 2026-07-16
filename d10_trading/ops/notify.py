@@ -50,6 +50,23 @@ def send(level: str, text: str) -> None:
         log.info("（Telegram 未設定或失敗，僅記錄於日誌）")
 
 
+def heartbeat(exit_code: int) -> None:
+    """healthchecks.io 心跳：批次結尾必 ping（含假日快速退出），
+    讓「排程沒跑」與「跑了但異常」都能被外部監控偵測。
+    未設定 HEALTHCHECK_URL 即略過；ping 失敗絕不影響批次結果。
+    """
+    if not config.HEALTHCHECK_URL:
+        return
+    url = config.HEALTHCHECK_URL.rstrip("/")
+    if exit_code != 0:
+        url += "/fail"
+    try:
+        requests.get(url, timeout=10)
+        log.info("heartbeat ping OK（exit=%d）", exit_code)
+    except Exception:  # noqa: BLE001 - 心跳失敗不可拖垮批次
+        log.warning("heartbeat ping 失敗（忽略）")
+
+
 def setup_logging() -> None:
     """檔案（月輪替）+ 主控台雙路日誌。"""
     config.LOG_DIR.mkdir(parents=True, exist_ok=True)

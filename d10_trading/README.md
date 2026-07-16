@@ -35,7 +35,7 @@ d10_trading/
 │   ├── reconcile.py     開場對帳（不一致 → 告警停止，絕不自動修正）
 │   ├── notify.py        Telegram + 日誌
 │   └── oplog.py         每日摘要 CSV / 成交 JSONL / 執行價 vs 收盤價稽核
-├── tests/             66 項測試（單元 + 黃金 + 整合 + 稽核）
+├── tests/             74 項測試（單元 + 黃金 + 整合 + 稽核 + 監控 hook）
 ├── .env.example       環境變數樣板（複製為 .env，永不提交）
 └── var/               執行期產物（狀態/快取/日誌，gitignored）
 ```
@@ -117,18 +117,16 @@ Unregister-ScheduledTask D10_daily -Confirm:$false     # 移除排程
 注意：任務以互動式使用者身分執行——電腦需維持**登入狀態**（螢幕鎖定沒關係，
 登出則不會執行）。
 
-**Linux（cron）**：
-```cron
-20 13 * * 1-5  cd /path/to/project && /path/to/ML_env/python -X utf8 -m d10_trading.main >> d10_trading/var/logs/cron.log 2>&1
-```
-假日由程式自行判斷（非交易日直接退出），排程照平日排即可。
+**Linux / 雲端 VPS**：完整部署 runbook 見 [deploy/README.md](../deploy/README.md)
+（systemd oneshot + timer、uv 鎖版環境、healthchecks 心跳、切換程序——
+🔴 切換時絕不允許雙機同時排程）。
 
 手動執行 / 測試：
 ```
 python -m d10_trading.main --dry-run                 # 完整流程但不下單、不落地
 python -m d10_trading.main --ignore-window           # 略過 13:05–13:40 時窗（測試用）
 python -m d10_trading.main --adopt-state             # 人工確認後以 API 部位重置狀態
-python -m pytest d10_trading/tests -q                # 66 項測試（含黃金測試）
+python -m pytest d10_trading/tests -q                # 74 項測試（含黃金測試）
 ```
 
 ## 4. 上線閘門檢核清單（🔴 每關需要使用者明確說「通過」）

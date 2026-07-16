@@ -102,6 +102,14 @@ SJ_CA_PASSWD = os.environ.get("SJ_CA_PASSWD", "")
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 
+# healthchecks.io 心跳（無人值守監控；空 = 略過）。批次結尾 ping：
+# 正常 → GET URL；異常 → GET URL/fail。排程缺席由 healthchecks 端發告警。
+HEALTHCHECK_URL = os.environ.get("HEALTHCHECK_URL", "")
+
+# CA 憑證到期預警（僅真實模式；需身分證字號查詢，空 = 略過檢查）
+SJ_PERSON_ID = os.environ.get("SJ_PERSON_ID", "")
+CA_EXPIRY_WARN_DAYS = 30
+
 # ── API 重試（§10）───────────────────────────────────────────────────────────
 RETRY_MAX = 3                # 查詢類 API 重試上限（指數退避）；下單不盲重試
 RETRY_BASE_SECS = 1.0

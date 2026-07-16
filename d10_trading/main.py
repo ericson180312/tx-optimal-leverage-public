@@ -49,10 +49,20 @@ class DayStop(RuntimeError):
         self.level, self.code = level, code
 
 
-def run_daily(broker: BrokerInterface, *, today: dt.date | None = None,
-              dry_run: bool = False, ignore_window: bool = False,
-              fetch_kwargs: dict | None = None,
-              sleep_fn=time.sleep) -> int:
+def run_daily(broker: BrokerInterface, **kwargs) -> int:
+    """日批次入口：執行 + 結尾心跳 ping（無論成敗，供外部排程監控）。"""
+    code = 1
+    try:
+        code = _run_daily(broker, **kwargs)
+        return code
+    finally:
+        notify.heartbeat(code)
+
+
+def _run_daily(broker: BrokerInterface, *, today: dt.date | None = None,
+               dry_run: bool = False, ignore_window: bool = False,
+               fetch_kwargs: dict | None = None,
+               sleep_fn=time.sleep) -> int:
     now = _now()
     today = today or now.date()
 
@@ -104,6 +114,7 @@ def _run_core(broker: BrokerInterface, st, today, now, dry_run, ignore_window,
         broker.login()
     except BrokerError as e:
         raise DayStop(f"登入失敗：{e}") from e
+    _check_ca(broker)
     try:
         month_map = {c.code: c.delivery_month
                      for c in broker.monthly_contracts(config.PRODUCT)}
@@ -323,6 +334,19 @@ def _run_core(broker: BrokerInterface, st, today, now, dry_run, ignore_window,
         return exit_code
     finally:
         broker.logout()
+
+
+def _check_ca(broker: BrokerInterface) -> None:
+    """CA 憑證到期預警（僅真實模式有值；預警失敗不影響批次）。"""
+    days = broker.ca_expiry_days()
+    if days is None:
+        return
+    audit("ca_check", days_left=days)
+    if days < 7:
+        notify.send("ALERT", f"CA 憑證將於 {days} 天內到期——"
+                             "請立即至 API 管理頁更新（README §5）")
+    elif days < config.CA_EXPIRY_WARN_DAYS:
+        notify.send("WARNING", f"CA 憑證剩餘 {days} 天到期，請儘早更新")
 
 
 def _describe(roll, front, nxt, target_c, held, target, delta) -> str:

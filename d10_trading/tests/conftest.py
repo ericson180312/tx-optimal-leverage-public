@@ -223,6 +223,8 @@ def _isolate_var(tmp_path, monkeypatch):
     # 測試絕不觸網：清空通知設定（使用者的 d10_trading/.env 可能已填真實 token）
     monkeypatch.setattr(config, "TELEGRAM_BOT_TOKEN", "")
     monkeypatch.setattr(config, "TELEGRAM_CHAT_ID", "")
+    monkeypatch.setattr(config, "HEALTHCHECK_URL", "")
+    monkeypatch.setattr(config, "SJ_PERSON_ID", "")
     yield
 
 

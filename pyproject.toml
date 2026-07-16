@@ -1,0 +1,22 @@
+# VPS 部署的執行期環境定義（uv sync；見 deploy/README.md）。
+# 本機開發沿用 conda ML_env——版本以下列鎖定值為準，兩邊一致，
+# 黃金測試（d10_trading/tests/test_golden.py）為環境等價的驗證手段。
+[project]
+name = "tx-optimal-leverage"
+version = "1.0.0"
+description = "台指最佳槓桿：回測研究（backtest_*）與 D_10 Shioaji 實盤（d10_trading）"
+requires-python = "==3.13.*"
+dependencies = [
+    "shioaji==1.5.6",
+    "pandas==3.0.3",
+    "numpy==2.4.6",
+    "pyarrow==24.0.0",
+    "requests==2.34.2",
+    "python-dotenv==1.2.2",
+]
+
+[dependency-groups]
+dev = ["pytest==9.1.1"]
+
+[tool.uv]
+package = false        # 純依賴定義，不安裝本專案自身（套件直接以 repo 根目錄執行）

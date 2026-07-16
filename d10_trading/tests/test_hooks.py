@@ -1,0 +1,92 @@
+"""部署監控 hook 測試：healthchecks 心跳、CA 到期預警。"""
+from __future__ import annotations
+
+from types import SimpleNamespace
+
+from d10_trading import config, main as main_mod
+from d10_trading.ops import notify
+from d10_trading.tests.test_integration import run, setup_scenario
+
+
+def _capture_pings(monkeypatch):
+    calls: list[str] = []
+    monkeypatch.setattr(config, "HEALTHCHECK_URL", "https://hc.example/ping")
+    monkeypatch.setattr(notify.requests, "get",
+                        lambda url, timeout=0: calls.append(url))
+    return calls
+
+
+def test_heartbeat_pings_on_success(monkeypatch):
+    broker = setup_scenario(monkeypatch)          # 無動作日 → exit 0
+    calls = _capture_pings(monkeypatch)
+    assert run(broker) == 0
+    assert calls == ["https://hc.example/ping"]
+
+
+def test_heartbeat_pings_fail_on_alert(monkeypatch):
+    broker = setup_scenario(monkeypatch, held_qty=3, state_qty=2)  # 對帳不符 → 1
+    calls = _capture_pings(monkeypatch)
+    assert run(broker) == 1
+    assert calls == ["https://hc.example/ping/fail"]
+
+
+def test_heartbeat_pings_even_on_holiday_and_kill_switch(monkeypatch):
+    import datetime as dt
+    broker = setup_scenario(monkeypatch)
+    calls = _capture_pings(monkeypatch)
+    assert run(broker, today=dt.date(2026, 7, 18)) == 0   # 週六
+    config.KILL_SWITCH_FILE.write_text("stop")
+    assert run(broker) == 0                               # 斷電開關
+    assert len(calls) == 2                                # 兩次都有 ping
+
+
+def test_heartbeat_failure_never_breaks_batch(monkeypatch):
+    broker = setup_scenario(monkeypatch)
+    monkeypatch.setattr(config, "HEALTHCHECK_URL", "https://hc.example/ping")
+
+    def boom(url, timeout=0):
+        raise OSError("network down")
+
+    monkeypatch.setattr(notify.requests, "get", boom)
+    assert run(broker) == 0                       # ping 失敗不影響批次結果
+
+
+def test_heartbeat_skipped_when_unset(monkeypatch):
+    broker = setup_scenario(monkeypatch)
+    called = []
+    monkeypatch.setattr(notify.requests, "get",
+                        lambda *a, **k: called.append(1))
+    assert run(broker) == 0                       # HEALTHCHECK_URL=""（conftest）
+    assert called == []
+
+
+# ── CA 到期預警 ──────────────────────────────────────────────────────────────
+
+def _stub_broker(days):
+    return SimpleNamespace(ca_expiry_days=lambda: days, simulation=False)
+
+
+def _capture_notify(monkeypatch):
+    sent = []
+    monkeypatch.setattr(main_mod.notify, "send",
+                        lambda level, text: sent.append((level, text)))
+    return sent
+
+
+def test_ca_check_warns_under_30_days(monkeypatch):
+    sent = _capture_notify(monkeypatch)
+    main_mod._check_ca(_stub_broker(20))
+    assert sent and sent[0][0] == "WARNING" and "20 天" in sent[0][1]
+
+
+def test_ca_check_alerts_under_7_days(monkeypatch):
+    sent = _capture_notify(monkeypatch)
+    main_mod._check_ca(_stub_broker(5))
+    assert sent and sent[0][0] == "ALERT"
+
+
+def test_ca_check_silent_when_ok_or_unavailable(monkeypatch):
+    sent = _capture_notify(monkeypatch)
+    main_mod._check_ca(_stub_broker(200))         # 距到期尚遠
+    main_mod._check_ca(_stub_broker(None))        # 模擬模式/未設 person_id
+    assert sent == []
