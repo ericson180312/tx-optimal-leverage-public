@@ -37,8 +37,8 @@ DAILY_RF = (1.0 + IDLE_CASH_RATE) ** (1.0 / TRADING_DAYS_PER_YEAR) - 1.0
 FINMIND_API        = "https://api.finmindtrade.com/api/v4/data"
 FUTURES_ID         = "TX"
 FUTURES_FIRST_YEAR = 1998       # TX 1998/07/21 上市
-BASE_DIR   = Path(__file__).resolve().parent
-DATA_DIR   = BASE_DIR / "data"
+BASE_DIR   = Path(__file__).resolve().parent          # backtest_threshold/
+DATA_DIR   = BASE_DIR.parent / "data"                 # repo 根目錄的共用 FinMind 快取
 OUTPUT_DIR = BASE_DIR / "output"
 CACHE_DIR  = OUTPUT_DIR / "cache"
 # 既有專案的 parquet 快取（存在就直接複製，不重抓）
