@@ -1,0 +1,107 @@
+"""D_10 自動交易系統——全部參數集中於此檔（規格 §10）。
+
+分層：
+1. 凍結策略參數（§3.1）——與第三輪回測逐位元一致，🔴 不得修改。
+2. 交易/執行參數（§4–§6）——合約選擇、下單容忍度、轉倉。
+3. 營運參數（§7）——路徑、通知、告警。
+4. 秘密（API key 等）一律走環境變數 / live/.env，程式碼與日誌永不出現明文。
+
+🔴 上線閘門（§9）：LIVE_TRADING 預設 False。G2 之前不得改為 True；
+   改動此常數視同進入真實下單階段，需使用者明確確認「通過」。
+"""
+from __future__ import annotations
+
+import os
+from pathlib import Path
+
+try:
+    from dotenv import load_dotenv
+except ImportError:  # dotenv 未安裝時仍可運作（僅靠真實環境變數）
+    load_dotenv = None
+
+# ── 路徑 ────────────────────────────────────────────────────────────────────
+LIVE_DIR = Path(__file__).resolve().parent            # live/
+ROOT_DIR = LIVE_DIR.parent                            # 回測專案根目錄
+VAR_DIR = LIVE_DIR / "var"                            # 執行期產物（gitignore）
+CACHE_DIR = VAR_DIR / "cache"                         # FinMind parquet 快取
+LOG_DIR = VAR_DIR / "logs"
+STATE_FILE = VAR_DIR / "state.json"
+KILL_SWITCH_FILE = LIVE_DIR / "KILL_SWITCH"           # 存在 → 程式啟動即退出（§7）
+HOLIDAY_FILE = LIVE_DIR / "data_static" / "taifex_holidays.csv"
+
+# 既有回測專案的 FinMind parquet 快取（存在就直接複製，不重抓）
+SIBLING_CACHE_DIRS = [
+    ROOT_DIR / "data",
+    Path(r"C:\Users\User\Desktop\python_台指跨月價差回測\analysis\roll_carry\data"),
+]
+
+if load_dotenv is not None:
+    load_dotenv(LIVE_DIR / ".env")
+
+# ── 凍結策略參數（§3.1，🔴 與回測逐位元一致，不得修改）─────────────────────
+MA_WINDOW = 200          # 還原連續期貨價的 200 日均線
+BUFFER = 0.01            # ±1% 遲滯緩衝帶
+L_HIGH = 2.0
+L_LOW = 1.0
+T_PLUS_1 = True          # 訊號日決定、次一交易日執行
+FUSE_L = 3.2             # 結構保險絲（斷電開關，正常永不觸發）
+
+# 訊號檢查時點（🔴 口徑說明）：規格草稿寫「固定每週某交易日」，但第三輪回測的
+# 實際規則是「連續序列索引 t % 5 == 0 的交易日檢查」（round3/signals.py
+# trend_leverage，check_every=5，t 自 1998-07-22 起算）。黃金測試（§3.2）要求
+# 訊號輸出與回測逐日完全一致，固定星期幾無法滿足（假日順延會使相位漂移），
+# 因此採用回測原始規則。序列每日追加後 t 持續遞增，檢查日完全可預測。
+SIGNAL_CHECK_EVERY = 5
+
+# ── 連續序列管線（§3.3，沿用回測口徑）───────────────────────────────────────
+FUTURES_ID = "TX"            # 訊號序列用 TX 大台（與回測一致）
+FUTURES_FIRST_YEAR = 1998    # TX 1998/07/21 上市
+ROLL_OFFSET_DAYS = 5         # 訊號序列的轉倉偏移（到期前 5 交易日；回測凍結值）
+FINMIND_API = "https://api.finmindtrade.com/api/v4/data"
+FINMIND_TOKEN = os.environ.get("FINMIND_TOKEN", "")   # 免費層可空
+DUAL_SOURCE_TOL = 0.001      # Shioaji vs FinMind 雙源核對容忍（0.1% → 告警）
+
+# ── 合約與口數（§4）─────────────────────────────────────────────────────────
+PRODUCT = "TMF"              # 預設 TMF 微型台指；可選 "MXF" 小台
+MULTIPLIERS = {"TMF": 10.0, "MXF": 50.0, "TXF": 200.0}   # 每點價值（NT$）
+MULTIPLIER = MULTIPLIERS[PRODUCT]
+TICK_POINTS = 1.0            # 台指期貨系列最小跳動 = 1 點
+SIGNAL_PRODUCT = "TXF"       # 訊號序列對應的 Shioaji 商品（TX 大台）
+
+# 防呆上限（§4）：依資金算出的合理上限 + 1 口，寫死於此。
+# 例：70 萬資金、指數 46,000、TMF 乘數 10 → 2x ≈ 3 口 → 上限 3 + 1 = 4。
+# 🔴 G2 階段（真實 1 口）應手動改為 1；G3 依實際資金重算。
+MAX_CONTRACTS = 4
+
+# ── 下單執行（§5）───────────────────────────────────────────────────────────
+PRICE_TOLERANCE_TICKS = 2    # 以最佳買/賣價讓 2 檔掛限價（禁用市價單）
+ORDER_TIMEOUT_SECS = 90      # 逾時未成交 → 改價一次（再讓 2 檔）→ 仍未成交撤單
+ORDER_POLL_SECS = 3          # 成交回報輪詢間隔
+EXEC_WINDOW = ("13:05", "13:40")   # 允許下單的時間窗（台北時間；日盤收盤前）
+TIMEZONE = "Asia/Taipei"
+
+# ── 轉倉（§6）───────────────────────────────────────────────────────────────
+ROLL_LEAD_DAYS = 5           # 月差 > 0 → 結算日前 5 交易日轉倉；否則結算日當天
+ROLL_USE_COMBO = True        # 優先用 TAIFEX 跨月價差單；失敗退回兩腳分開下
+
+# ── 上線閘門（§9）🔴 ────────────────────────────────────────────────────────
+LIVE_TRADING = False         # G2 之前絕不改 True；True = 真實資金下單
+SIMULATION = not LIVE_TRADING
+
+# 模擬環境的 margin() 回傳 0（Shioaji 模擬伺服器不提供權益數），
+# G1 期間以此常數作為名目權益供口數計算；真實模式一律用 API 權益數。
+SIM_EQUITY = float(os.environ.get("SIM_EQUITY", "700000"))
+
+# ── 認證（一律環境變數，永不落地程式碼/日誌）────────────────────────────────
+SJ_API_KEY = os.environ.get("SJ_API_KEY", "")
+SJ_SEC_KEY = os.environ.get("SJ_SEC_KEY", "")
+SJ_CA_PATH = os.environ.get("SJ_CA_PATH", "")         # 真實下單必需；模擬不需
+SJ_CA_PASSWD = os.environ.get("SJ_CA_PASSWD", "")
+
+# ── 通知（§7）────────────────────────────────────────────────────────────────
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
+
+# ── API 重試（§10）───────────────────────────────────────────────────────────
+RETRY_MAX = 3                # 查詢類 API 重試上限（指數退避）；下單不盲重試
+RETRY_BASE_SECS = 1.0

@@ -1,0 +1,16 @@
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# 本機環境
+.vscode/
+shioaji.log
+
+# live 交易系統：秘密與執行期產物永不提交
+live/.env
+live/var/
+live/KILL_SWITCH
+
+# 憑證
+*.pfx
