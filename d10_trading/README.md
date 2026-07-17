@@ -97,10 +97,13 @@ Telegram：向 @BotFather 建 bot 取得 token，填 `TELEGRAM_BOT_TOKEN` / `TEL
 
 **Windows（本機，工作排程器）** — 已於 2026-07-16 依下列方式註冊（任務名 `D10_daily`）：
 
-入口為 [scripts/run_daily.bat](scripts/run_daily.bat)（切換工作目錄＋輸出導向
-`var/logs/scheduler.log`），註冊：
+入口為 [scripts/run_daily.bat](scripts/run_daily.bat)（輸出導向 `var/logs/scheduler.log`）。
+⚠️ **bat 檔內容必須純 ASCII**：cmd.exe 以 OEM 編碼（zh-TW 為 CP950）讀取 .bat
+位元組，檔內若有 UTF-8 中文（例如 repo 路徑）會成亂碼導致 cd 失敗——G1 首日
+（2026-07-17）即因此未觸發。中文路徑一律以 `%~dp0` 於執行期解析。註冊：
 ```powershell
-$action   = New-ScheduledTaskAction -Execute "C:\Users\User\Desktop\python_台指最佳槓桿\d10_trading\scripts\run_daily.bat"
+$action   = New-ScheduledTaskAction -Execute "C:\Users\User\Desktop\python_台指最佳槓桿\d10_trading\scripts\run_daily.bat" `
+            -WorkingDirectory "C:\Users\User\Desktop\python_台指最佳槓桿"
 $trigger  = New-ScheduledTaskTrigger -Weekly -DaysOfWeek Monday,Tuesday,Wednesday,Thursday,Friday -At "13:20"
 $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
             -StartWhenAvailable -WakeToRun -ExecutionTimeLimit (New-TimeSpan -Minutes 30)
