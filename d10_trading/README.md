@@ -117,8 +117,19 @@ Get-ScheduledTask D10_daily | Get-ScheduledTaskInfo   # 查下次執行時間/�
 Start-ScheduledTask D10_daily                          # 立即手動觸發（測試）
 Unregister-ScheduledTask D10_daily -Confirm:$false     # 移除排程
 ```
-注意：任務以互動式使用者身分執行——電腦需維持**登入狀態**（螢幕鎖定沒關係，
-登出則不會執行）。
+任務以互動式使用者身分執行（`LogonType: Interactive`），13:20 觸發時
+電腦各狀態的行為（2026-07-17 依實際任務設定核對）：
+
+| 電腦狀態 | 會觸發？ | 說明 |
+|---|---|---|
+| 使用中 / **螢幕鎖定** | ✅ | 判定條件是「登入 session 存在」，與螢幕是否解鎖無關 |
+| **睡眠** | ✅ | `WakeToRun` 會喚醒電腦執行 |
+| **完全登出** | ❌ | Interactive 型任務需要 session；交易日請保持登入（鎖定即可） |
+| **關機 / 休眠斷電** | ❌ | 無法喚醒；開機後 `StartWhenAvailable` 會補跑，但已過執行時間窗 → 拒單告警（= 今日已略過通知），次一交易日自動恢復 |
+
+若未來需要「登出也能跑」，須改用 `Password` 登入類型（註冊時存 Windows
+密碼）；但該場景更適合直接走 [deploy/README.md](../deploy/README.md) 的
+VPS 方案（systemd 不依賴登入 session）。
 
 **Linux / 雲端 VPS**：完整部署 runbook 見 [deploy/README.md](../deploy/README.md)
 （systemd oneshot + timer、uv 鎖版環境、healthchecks 心跳、切換程序——
