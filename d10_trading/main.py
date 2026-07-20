@@ -199,8 +199,8 @@ def _run_core(broker: BrokerInterface, st, today, now, dry_run, ignore_window,
             notify.send("INFO", f"regime 切換：今日執行槓桿 {st.exec_leverage} → "
                                 f"{l_exec}（{cur_regime}）")
 
-        # ── 補寫前日「執行價 vs 官方收盤」稽核 ─────────────────────────────
-        _flush_exec_audit(broker, st)
+        # ── 補寫前日「執行價 vs 官方結算價」稽核 ───────────────────────────
+        _flush_exec_audit(st, ss)
 
         # ── 4. 目標口數與轉倉檢查 ──────────────────────────────────────────
         front, nxt = broker.front_and_next(config.PRODUCT, today)
@@ -386,20 +386,25 @@ def _fuse_emergency(broker, st, recon, today, sleep_fn, why: str) -> int:
     return 2
 
 
-def _flush_exec_audit(broker: BrokerInterface, st) -> None:
-    """次日補寫「執行價 vs 官方收盤價」（規格 §2）。失敗不影響流程。"""
+def _flush_exec_audit(st, ss) -> None:
+    """補寫「執行價 vs 官方結算價」（規格 §2）。失敗不影響流程。
+
+    結算價取自當次重建的 FinMind TX 序列（ss.settlement_of）——權威結算來源、
+    與策略口徑一致，取代先前的日盤 K 棒收盤（那是收盤集合競價價、非結算）。
+    結算價未到位（同日尚無 FinMind）→ 保留待下次批次補記。
+    """
     remain = []
     for rec in st.pending_exec_audit:
         try:
             d = dt.date.fromisoformat(rec["date"])
             month = rec.get("month", "")
             if not month or "->" in rec.get("code", ""):
-                continue                       # 轉倉淨價無單一收盤對照
-            close = broker.day_session_close(config.PRODUCT, month, d)
-            if close:
-                oplog.append_exec_vs_close(d, rec["code"], rec["price"], close)
+                continue                       # 轉倉淨價無單一結算對照
+            settle = ss.settlement_of(month, d)
+            if settle:
+                oplog.append_exec_vs_close(d, rec["code"], rec["price"], settle)
             else:
-                remain.append(rec)
+                remain.append(rec)             # 結算未到位 → 次日再補
         except Exception:  # noqa: BLE001 - 稽核補寫失敗不影響交易
             remain.append(rec)
     st.pending_exec_audit = remain

@@ -151,6 +151,15 @@ def test_exec_index_skips_today_official_row():
     assert ss.today_index(TODAY) == ss.n_official - 1   # 今日列作預覽
 
 
+def test_settlement_of_returns_tx_settlement():
+    """exec_vs_close 稽核用：TX 月合約在官方日的結算價；查無回 None。"""
+    ss = build_signal_series(_cdf(price_fn=lambda d: 42600.0))
+    month, d = ss.held_contract, ss.last_official_date
+    assert ss.settlement_of(month, d) == pytest.approx(42600.0)
+    assert ss.settlement_of(month, dt.date(2000, 1, 1)) is None   # 日期不在序列
+    assert ss.settlement_of("209912", d) is None                  # 無此合約
+
+
 def test_today_index_none_when_absent():
     ss = build_signal_series(_cdf())
     assert ss.today_index(TODAY) is None

@@ -83,13 +83,12 @@ class FakeBroker(BrokerInterface):
 
     def __init__(self, *, equity: float, contracts: list[ContractInfo],
                  quotes: dict[str, Quote], positions: list[PositionInfo] = None,
-                 closes: dict[tuple, float] = None, fill_mode: str = "fill",
+                 fill_mode: str = "fill",
                  combo_fill_mode: str | None = None, combo_raises: bool = False):
         self._equity = equity
         self._contracts = contracts
         self.quotes = quotes
         self._positions = list(positions or [])
-        self.closes = closes or {}
         self.fill_mode = fill_mode
         self.combo_fill_mode = combo_fill_mode or fill_mode
         self.combo_raises = combo_raises
@@ -109,9 +108,6 @@ class FakeBroker(BrokerInterface):
 
     def quote(self, code: str) -> Quote:
         return self.quotes[code]
-
-    def day_session_close(self, product, month, date) -> float | None:
-        return self.closes.get((product, month, date))
 
     def equity(self) -> float:
         return self._equity

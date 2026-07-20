@@ -44,6 +44,20 @@ class SignalSeries:
     last_official_price: float        # 該合約最後官方價（暫定價換算基準）
     cs: ContinuousSeries              # 完整面板（稽核）
     warnings: list[str] = field(default_factory=list)
+    cdf: pd.DataFrame | None = field(default=None, repr=False)   # 原始 TX 逐合約長表
+
+    def settlement_of(self, contract_month: str, date: dt.date) -> float | None:
+        """指定 TX 月份合約在 date 的官方結算價（FinMind）；查無回 None。
+
+        用於 exec_vs_close 稽核（規格 §2）：交易的是 TMF 微台，但結算價以
+        TX 大台為權威來源（策略口徑本就定義在 TX；TMF/TX 每日結算價差極小，
+        <2 點，落在稽核關注的『執行 vs 收盤』時間滑價量級之內）。
+        """
+        if self.cdf is None:
+            return None
+        m = self.cdf[(self.cdf["contract"] == contract_month)
+                     & (self.cdf["date"] == pd.Timestamp(date))]
+        return float(m["price"].iloc[0]) if not m.empty else None
 
     @property
     def last_official_date(self) -> dt.date:
@@ -92,7 +106,7 @@ def build_signal_series(cdf: pd.DataFrame) -> SignalSeries:
         dates=dates, spot=spot, n_official=len(dates),
         held_contract=str(panel["contract"].iloc[-1]),
         last_official_price=float(panel["price"].iloc[-1]),
-        cs=cs,
+        cs=cs, cdf=cdf,
     )
 
 

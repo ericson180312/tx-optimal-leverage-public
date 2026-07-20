@@ -8,6 +8,7 @@ from __future__ import annotations
 import datetime as dt
 
 from d10_trading import config
+from d10_trading import main as main_mod
 from d10_trading.data import calendar
 from d10_trading.data import series as series_mod
 from d10_trading.data.series import build_signal_series
@@ -41,7 +42,7 @@ def _front_month(today: dt.date) -> str:
 def setup_scenario(monkeypatch, *, today=TODAY, price_fn=CONST,
                    equity=700_000.0, held_qty=3, state_qty=None,
                    state_lev=2.0, spread=20.0, fill_mode="fill",
-                   cdf_end=None, closes_override=None, no_state=False):
+                   cdf_end=None, no_state=False):
     """組出（broker, 前置 state）；價格/持倉/行情皆可控。"""
     cdf = synth_cdf(price_fn, START, cdf_end or calendar.prev_trading_day(today))
     monkeypatch.setattr(series_mod, "load_tx_contracts", lambda **kw: cdf)
@@ -60,17 +61,12 @@ def setup_scenario(monkeypatch, *, today=TODAY, price_fn=CONST,
         p = px + (spread if c.delivery_month > front else 0.0)
         quotes[c.code] = flat_quote(c.code, p)
 
-    closes = {(config.SIGNAL_PRODUCT, ss.held_contract, ss.last_official_date):
-              ss.last_official_price}
-    if closes_override:
-        closes.update(closes_override)
-
     positions = []
     if held_qty > 0:
         positions = [PositionInfo(code=f"TMF{front}", direction="Buy",
                                   quantity=held_qty, avg_price=px)]
     broker = FakeBroker(equity=equity, contracts=contracts, quotes=quotes,
-                        positions=positions, closes=closes, fill_mode=fill_mode)
+                        positions=positions, fill_mode=fill_mode)
 
     if not no_state:
         sq = held_qty if state_qty is None else state_qty
@@ -245,3 +241,40 @@ def test_dry_run_places_nothing_and_keeps_state(monkeypatch):
     st = state_mod.load()
     assert st.executed_date is None               # dry-run 不落地執行旗標
     assert st.exec_leverage == 2.0                # 狀態維持前值
+
+
+# ── exec_vs_close 稽核（結算價基準）─────────────────────────────────────────
+
+def test_exec_vs_close_uses_settlement(monkeypatch):
+    """_flush_exec_audit 以 FinMind TX 結算價（非 K 棒收盤）補記，並移出 pending。"""
+    cdf = synth_cdf(CONST, START, calendar.prev_trading_day(TODAY))
+    ss = build_signal_series(cdf)
+    d, month = ss.last_official_date, ss.held_contract
+    st = State(pending_exec_audit=[
+        {"date": d.isoformat(), "code": f"TMF{month}", "month": month, "price": 46055.0},
+        {"date": TODAY.isoformat(), "code": "TMFZ9", "month": "209912", "price": 1.0},
+    ])
+    main_mod._flush_exec_audit(st, ss)
+
+    # 有結算者補記並移出；無結算者保留待下次
+    assert [r["month"] for r in st.pending_exec_audit] == ["209912"]
+    rows = (config.LOG_DIR / "exec_vs_close.csv").read_text(
+        encoding="utf-8-sig").splitlines()
+    assert rows[0] == "date,code,exec_price,settlement,diff_pct"
+    fields = rows[1].split(",")
+    assert fields[3] == "46000.0"                 # settlement = TX 結算（CONST）
+    assert fields[2] == "46055.0"                 # 執行價
+    assert abs(float(fields[4]) - (46055.0 / 46000.0 - 1.0)) < 1e-9
+
+
+def test_exec_vs_close_skips_roll_records(monkeypatch):
+    """轉倉淨價無單一結算對照 → 跳過（不補記、不留 pending）。"""
+    cdf = synth_cdf(CONST, START, calendar.prev_trading_day(TODAY))
+    ss = build_signal_series(cdf)
+    d = ss.last_official_date
+    st = State(pending_exec_audit=[
+        {"date": d.isoformat(), "code": "TMFH6->TMFI6", "month": "202609", "price": 250.0},
+    ])
+    main_mod._flush_exec_audit(st, ss)
+    assert st.pending_exec_audit == []
+    assert not (config.LOG_DIR / "exec_vs_close.csv").exists()

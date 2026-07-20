@@ -85,8 +85,6 @@ class BrokerInterface:
     def logout(self) -> None: raise NotImplementedError
     def monthly_contracts(self, product: str) -> list[ContractInfo]: raise NotImplementedError
     def quote(self, code: str) -> Quote: raise NotImplementedError
-    def day_session_close(self, product: str, delivery_month: str,
-                          date: dt.date) -> float | None: raise NotImplementedError
     def equity(self) -> float: raise NotImplementedError
     def positions(self) -> list[PositionInfo]: raise NotImplementedError
     def ca_expiry_days(self) -> int | None:
@@ -287,30 +285,6 @@ class ShioajiBroker(BrokerInterface):
                 ask=float(getattr(snap, "sell_price", 0.0) or 0.0),
             )
         return _retry(_do, f"snapshot {code}")
-
-    def day_session_close(self, product: str, delivery_month: str,
-                          date: dt.date) -> float | None:
-        """指定月份合約在 date 的日盤收盤價（08:45–13:45 最後一根 K 棒收盤）。"""
-        def _do():
-            import pandas as pd
-            code = self.contract_by_month(product, delivery_month).code
-            kb = self._api.kbars(self._contract_obj(code),
-                                 start=date.isoformat(), end=date.isoformat())
-            ts = pd.to_datetime(list(kb.ts))
-            closes = list(kb.Close)
-            best_i, best_ts = -1, None
-            for i, t in enumerate(ts):
-                if t.date() != date:
-                    continue
-                hm = t.hour * 60 + t.minute
-                if 8 * 60 + 45 <= hm <= 13 * 60 + 45:   # 僅日盤
-                    if best_ts is None or t > best_ts:
-                        best_i, best_ts = i, t
-            return float(closes[best_i]) if best_i >= 0 else None
-        try:
-            return _retry(_do, f"kbars {product}{delivery_month} {date}")
-        except BrokerError:
-            return None
 
     # ── 帳務 ────────────────────────────────────────────────────────────────
     def equity(self) -> float:

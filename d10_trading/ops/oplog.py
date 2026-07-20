@@ -46,14 +46,19 @@ def write_fills(date: dt.date, fills) -> None:
 
 
 def append_exec_vs_close(date: dt.date, code: str, exec_price: float,
-                         official_close: float) -> None:
-    """執行價 vs 官方收盤價偏差記錄（規格 §2：供事後檢視）。次日補寫。"""
+                         settlement: float) -> None:
+    """執行價 vs 官方結算價偏差記錄（規格 §2：供事後檢視）。結算到位後補寫。
+
+    settlement 為 FinMind TX 大台結算價（權威來源；交易的 TMF 與 TX 每日結算價
+    差極小，見 series.SignalSeries.settlement_of）。diff 反映『13:20 執行 vs 收盤
+    結算』的時間滑價（含微幅 TMF/TX 基差）。
+    """
     path = config.LOG_DIR / "exec_vs_close.csv"
     config.LOG_DIR.mkdir(parents=True, exist_ok=True)
     new = not path.exists()
     with open(path, "a", newline="", encoding="utf-8-sig") as f:
         w = csv.writer(f)
         if new:
-            w.writerow(["date", "code", "exec_price", "official_close", "diff_pct"])
-        diff = (exec_price / official_close - 1.0) if official_close else ""
-        w.writerow([date.isoformat(), code, exec_price, official_close, diff])
+            w.writerow(["date", "code", "exec_price", "settlement", "diff_pct"])
+        diff = (exec_price / settlement - 1.0) if settlement else ""
+        w.writerow([date.isoformat(), code, exec_price, settlement, diff])
