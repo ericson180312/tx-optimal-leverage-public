@@ -228,13 +228,16 @@ def _isolate_var(tmp_path, monkeypatch):
     yield
 
 
-def make_contracts(product: str, months: list[str]) -> list[ContractInfo]:
+def make_contracts(product: str, months: list[str],
+                   references: dict[str, float] | None = None) -> list[ContractInfo]:
+    references = references or {}
     out = []
     for m in months:
         y, mm = int(m[:4]), int(m[4:])
         out.append(ContractInfo(code=f"{product}{m}", product=product,
                                 delivery_month=m,
-                                delivery_date=calendar.settlement_date(y, mm)))
+                                delivery_date=calendar.settlement_date(y, mm),
+                                reference=float(references.get(m, 0.0))))
     return out
 
 

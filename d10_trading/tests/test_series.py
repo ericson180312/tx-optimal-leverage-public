@@ -38,7 +38,7 @@ def test_spot_equals_price_path_when_no_gap(monkeypatch):
 def test_freshness_ok_and_provisional(monkeypatch):
     cdf = _cdf()
     monkeypatch.setattr(series, "load_tx_contracts", lambda **kw: cdf)
-    ss = prepare_series(TODAY, yesterday_close_fn=lambda m, d: 46000.0,
+    ss = prepare_series(TODAY, prev_settlement_fn=lambda m: 46000.0,
                         today_price_fn=lambda m: 46100.0)
     assert ss.last_official_date == PREV
     assert ss.has_provisional and ss.dates[-1] == TODAY
@@ -50,14 +50,14 @@ def test_stale_two_days_raises(monkeypatch):
     cdf = _cdf(end=calendar.prev_trading_day(PREV) - dt.timedelta(days=1))
     monkeypatch.setattr(series, "load_tx_contracts", lambda **kw: cdf)
     with pytest.raises(DataStaleError):
-        prepare_series(TODAY, yesterday_close_fn=lambda m, d: 46000.0)
+        prepare_series(TODAY, prev_settlement_fn=lambda m: 46000.0)
 
 
 def test_missing_yesterday_falls_back_to_shioaji(monkeypatch):
     cdf = _cdf(end=calendar.prev_trading_day(PREV))     # FinMind 缺 7/15
     monkeypatch.setattr(series, "load_tx_contracts", lambda **kw: cdf)
-    ss = prepare_series(TODAY, yesterday_close_fn=lambda m, d: 46200.0)
-    assert ss.last_official_date == PREV                # 已以 Shioaji 收盤遞補
+    ss = prepare_series(TODAY, prev_settlement_fn=lambda m: 46200.0)
+    assert ss.last_official_date == PREV                # 已以 Shioaji 參考價遞補
     assert any("暫代" in w for w in ss.warnings)
 
 
@@ -65,15 +65,51 @@ def test_missing_yesterday_and_no_shioaji_stops(monkeypatch):
     cdf = _cdf(end=calendar.prev_trading_day(PREV))
     monkeypatch.setattr(series, "load_tx_contracts", lambda **kw: cdf)
     with pytest.raises(DataStaleError):
-        prepare_series(TODAY, yesterday_close_fn=lambda m, d: None)
+        prepare_series(TODAY, prev_settlement_fn=lambda m: None)
 
 
 def test_dual_source_divergence_warns(monkeypatch):
     cdf = _cdf()
     monkeypatch.setattr(series, "load_tx_contracts", lambda **kw: cdf)
     ss = prepare_series(TODAY,
-                        yesterday_close_fn=lambda m, d: 46000.0 * 1.002)
+                        prev_settlement_fn=lambda m: 46000.0 * 1.002)
     assert any("雙源核對" in w for w in ss.warnings)
+
+
+def test_dual_source_reference_no_false_alarm_2026_07_17(monkeypatch):
+    """🔴 回歸：改用 reference（=結算價）後，7/17「收盤競價 vs 結算」不再誤報。
+
+    實際事件：FinMind 結算 42604、Shioaji 13:45 K 棒收盤（收盤集合競價）42725，
+    差 0.284% 曾誤觸雙源告警。改用 contract.reference（=前日結算 42604）比對後，
+    差 0 → 無告警。此測試以 42604 為 FinMind 官方價、reference 回 42604。
+    """
+    cdf = _cdf(price_fn=lambda d: 42604.0)
+    monkeypatch.setattr(series, "load_tx_contracts", lambda **kw: cdf)
+    ss = prepare_series(TODAY, prev_settlement_fn=lambda m: 42604.0)
+    assert ss.last_official_price == 42604.0
+    assert not [w for w in ss.warnings if "雙源核對" in w]
+    # 對照：若仍拿收盤競價 42725 比對，會超過 0.1% 容忍
+    assert abs(42725.0 / 42604.0 - 1.0) > config.DUAL_SOURCE_TOL
+
+
+def test_dual_source_skipped_when_ref_not_trustworthy(monkeypatch):
+    """盤後（reference 已滾動成當日）→ ref_trustworthy=False → 不做核對、不假警報。"""
+    cdf = _cdf(price_fn=lambda d: 42604.0)
+    monkeypatch.setattr(series, "load_tx_contracts", lambda **kw: cdf)
+    # 即使 reference 回一個差很多的值（模擬盤後滾動後的當日結算），也不告警
+    ss = prepare_series(TODAY, prev_settlement_fn=lambda m: 42725.0,
+                        ref_trustworthy=False)
+    assert not [w for w in ss.warnings if "雙源核對" in w]
+
+
+def test_fallback_uses_reference_value(monkeypatch):
+    """FinMind 缺前日 → 以 reference（結算價）補列，且訊息標明『參考價』。"""
+    cdf = _cdf(price_fn=lambda d: 42604.0, end=calendar.prev_trading_day(PREV))
+    monkeypatch.setattr(series, "load_tx_contracts", lambda **kw: cdf)
+    ss = prepare_series(TODAY, prev_settlement_fn=lambda m: 42611.0)
+    assert ss.last_official_date == PREV
+    assert ss.last_official_price == 42611.0          # 補進去的是 reference 值
+    assert any("參考價" in w and "暫代" in w for w in ss.warnings)
 
 
 def test_preview_failure_does_not_stop(monkeypatch):
@@ -83,7 +119,7 @@ def test_preview_failure_does_not_stop(monkeypatch):
     def boom(month):
         raise RuntimeError("expired contract")
 
-    ss = prepare_series(TODAY, yesterday_close_fn=lambda m, d: 46000.0,
+    ss = prepare_series(TODAY, prev_settlement_fn=lambda m: 46000.0,
                         today_price_fn=boom)
     assert not ss.has_provisional
     assert any("即時價查詢失敗" in w for w in ss.warnings)

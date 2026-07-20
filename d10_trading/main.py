@@ -147,13 +147,16 @@ def _run_core(broker: BrokerInterface, st, today, now, dry_run, ignore_window,
 
         # ── 3. 資料更新與訊號 ──────────────────────────────────────────────
         try:
+            # reference 僅在日盤收盤（13:45）前 = 前日結算；之後滾動成當日值
+            ref_ok = now.time() < dt.time.fromisoformat(config.DAY_SESSION_CLOSE)
             ss = prepare_series(
                 today,
                 fetch_kwargs=fetch_kwargs,
-                yesterday_close_fn=lambda m, d: broker.day_session_close(
-                    config.SIGNAL_PRODUCT, m, d),
+                prev_settlement_fn=lambda m: broker.settlement_reference(
+                    config.SIGNAL_PRODUCT, m),
                 today_price_fn=lambda m: broker.quote(
                     broker.contract_by_month(config.SIGNAL_PRODUCT, m).code).price,
+                ref_trustworthy=ref_ok,
             )
         except DataStaleError as e:
             if fuse_mode:

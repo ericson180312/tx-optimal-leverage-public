@@ -60,6 +60,11 @@ ROLL_OFFSET_DAYS = 5         # 訊號序列的轉倉偏移（到期前 5 交易�
 FINMIND_API = "https://api.finmindtrade.com/api/v4/data"
 FINMIND_TOKEN = os.environ.get("FINMIND_TOKEN", "")   # 免費層可空
 DUAL_SOURCE_TOL = 0.001      # Shioaji vs FinMind 雙源核對容忍（0.1% → 告警）
+# 雙源核對用 Shioaji contract.reference（=前一交易日結算價，與 FinMind 同口徑）。
+# ⚠️ reference 只在「日盤收盤前」等於前日結算；日盤收盤（13:45）後 TAIFEX 公布當日
+# 結算、reference 隨即滾動成當日值（實測 2026-07-20）。故僅在此時刻前才信任 reference
+# 做核對；批次固定 13:20 執行、恆在此窗內。盤後 dry-run 會跳過核對（避免假警報）。
+DAY_SESSION_CLOSE = "13:45"
 
 # ── 合約與口數（§4）─────────────────────────────────────────────────────────
 PRODUCT = "TMF"              # 預設 TMF 微型台指；可選 "MXF" 小台

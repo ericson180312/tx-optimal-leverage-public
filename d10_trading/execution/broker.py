@@ -116,6 +116,21 @@ class BrokerInterface:
                 return c
         raise BrokerError(f"{product} 找不到 {month} 月合約")
 
+    def settlement_reference(self, product: str, month: str) -> float | None:
+        """指定月份合約的參考價（reference）＝**前一交易日結算價**。
+
+        TAIFEX 參考價定義為前一交易日結算價，與 FinMind 的結算價同口徑
+        （已實測：Shioaji reference 與 FinMind settlement 對得上）。
+        用於雙源核對與 FinMind 缺漏遞補——刻意不用日盤 K 棒收盤，因為
+        13:45 那根是「收盤集合競價價」，與結算價本有結構性差異（可達 0.3%），
+        兩者比對會誤報。查不到（未載入/新合約無結算）回 None。
+        """
+        try:
+            ref = self.contract_by_month(product, month).reference
+        except BrokerError:
+            return None
+        return float(ref) if ref and ref > 0 else None
+
 
 def _retry(fn, what: str):
     """查詢類 API 的指數退避重試。"""

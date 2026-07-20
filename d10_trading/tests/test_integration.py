@@ -48,7 +48,11 @@ def setup_scenario(monkeypatch, *, today=TODAY, price_fn=CONST,
     ss = build_signal_series(cdf)
 
     months = sorted(set(_months_around(today)) | {ss.held_contract})
-    contracts = make_contracts("TXF", months) + make_contracts("TMF", months)
+    # 雙源核對用 Shioaji 參考價（=前日結算價）；令 TXF 持倉月參考價 = FinMind
+    # 最後官方價 → 差 0，乾淨情境不觸發告警（與實際運行一致）。
+    txf_refs = {ss.held_contract: ss.last_official_price}
+    contracts = (make_contracts("TXF", months, references=txf_refs)
+                 + make_contracts("TMF", months))
     px = float(price_fn(today))
     front = _front_month(today)
     quotes = {}

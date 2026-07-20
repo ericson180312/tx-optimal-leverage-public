@@ -9,11 +9,12 @@
   (a) 今日訊號的「預覽」（明日以官方收盤重算定案）、(b) 口數換算、(c) 執行價記錄。
 
 新鮮度規則（規格 §3.3）：
-- 官方序列最後日期必須 = 上一交易日。FinMind 未更新時，退回 Shioaji 日盤收盤價
-  補「暫定官方」列（告警記錄，次日 FinMind 到位後自動以結算價重建覆蓋）；
-  兩者皆無 → DataStaleError，停止且絕不用舊資料下單。
-- 雙源核對：上一交易日的 FinMind 結算價 vs Shioaji 日盤收盤價，
-  相對差 > DUAL_SOURCE_TOL → 告警（結算價與收盤價本有微小差異，僅示警不停止）。
+- 官方序列最後日期必須 = 上一交易日。FinMind 未更新時，退回 Shioaji **參考價
+  （contract.reference = 前日結算價）** 補「暫定官方」列（告警記錄，次日 FinMind
+  到位後自動以結算價重建覆蓋）；兩者皆無 → DataStaleError，停止且絕不用舊資料下單。
+- 雙源核對：上一交易日的 FinMind 結算價 vs Shioaji 參考價（兩者同為 TAIFEX 結算價、
+  同口徑），相對差 > DUAL_SOURCE_TOL → 告警。刻意不用日盤 K 棒收盤——13:45 那根是
+  「收盤集合競價價」，與結算價有結構性差異（可達 0.3%），比對會誤報（2026-07 實測）。
 """
 from __future__ import annotations
 
@@ -97,11 +98,12 @@ def build_signal_series(cdf: pd.DataFrame) -> SignalSeries:
 
 def append_official_fallback(ss: SignalSeries, date: dt.date, price: float,
                              source: str) -> SignalSeries:
-    """FinMind 缺上一交易日時，以 Shioaji 日盤收盤價補一列「暫定官方」。
+    """FinMind 缺上一交易日時，以 Shioaji **參考價（前日結算價）**補一列「暫定官方」。
 
     以持倉合約的價格比值延伸 spot（同合約內報酬，與逐合約法口徑一致）。
-    次日 FinMind 到位後整條序列以結算價重建，本列自動被覆蓋；
-    若覆蓋後訊號與本列不同，main 會比對 state 併發告警。
+    參考價與 FinMind 結算價同口徑，故補進去的即等同真結算價；
+    次日 FinMind 到位後整條序列仍以結算價重建、本列被覆蓋（若訊號因此變動
+    main 會比對 state 併發告警）。
     """
     r = price / ss.last_official_price - 1.0
     ss.dates.append(date)
@@ -109,7 +111,7 @@ def append_official_fallback(ss: SignalSeries, date: dt.date, price: float,
     ss.n_official += 1
     ss.last_official_price = price
     ss.warnings.append(
-        f"{date} 官方結算價缺漏，以 {source} 收盤價 {price:.0f} 暫代（次日自動校正）")
+        f"{date} 官方結算價缺漏，以 {source}（前日結算價）{price:.0f} 暫代（次日自動校正）")
     return ss
 
 
@@ -124,12 +126,18 @@ def append_provisional(ss: SignalSeries, date: dt.date, price: float) -> SignalS
 
 def prepare_series(today: dt.date, *,
                    fetch_kwargs: dict | None = None,
-                   yesterday_close_fn=None,
-                   today_price_fn=None) -> SignalSeries:
+                   prev_settlement_fn=None,
+                   today_price_fn=None,
+                   ref_trustworthy: bool = True) -> SignalSeries:
     """日常批次的序列準備（重建 → 新鮮度 → 暫定列）。
 
-    yesterday_close_fn(contract_yyyymm, date) -> float | None
-        Shioaji 日盤收盤價（雙源核對與 FinMind 缺漏遞補用）。
+    prev_settlement_fn(contract_yyyymm) -> float | None
+        Shioaji **前一交易日結算價**（= contract.reference；雙源核對與
+        FinMind 缺漏遞補用）。刻意用結算價而非日盤 K 棒收盤——後者是
+        收盤集合競價價，與結算價本有結構性差異、會使核對誤報。
+    ref_trustworthy: reference 是否確為「前日結算價」。日盤收盤（13:45）後 reference
+        會滾動成當日結算，此時傳 False → 跳過雙源核對（避免盤後假警報）。批次固定
+        13:20 執行恆為 True；遞補仍會用 reference（僅在執行時窗內具下單後果、彼時正確）。
     today_price_fn(contract_yyyymm) -> float | None
         今日即時價（暫定列）。None → 不加暫定列（預覽略過，不影響下單）。
     """
@@ -149,24 +157,26 @@ def prepare_series(today: dt.date, *,
             raise DataStaleError(
                 f"官方序列最後日期 {ss.last_official_date} 落後上一交易日 "
                 f"{prev_td} 超過一日，無法以單日遞補")
-        px = yesterday_close_fn(ss.held_contract, prev_td) if yesterday_close_fn else None
+        px = prev_settlement_fn(ss.held_contract) if prev_settlement_fn else None
         if px is None or px <= 0:
             raise DataStaleError(
-                f"FinMind 與 Shioaji 皆無 {prev_td} 收盤資料——停止，絕不用舊資料下單")
-        append_official_fallback(ss, prev_td, float(px), "Shioaji")
+                f"FinMind 與 Shioaji 皆無 {prev_td} 結算資料——停止，絕不用舊資料下單")
+        append_official_fallback(ss, prev_td, float(px), "Shioaji 參考價")
     elif ss.last_official_date > today:
         raise DataStaleError(
             f"官方序列出現未來日期 {ss.last_official_date}（時鐘或資料異常）")
 
-    # ── 雙源核對：上一交易日 FinMind 結算價 vs Shioaji 收盤價 ─────────────
-    if yesterday_close_fn is not None and ss.last_official_date == prev_td:
-        sj_px = yesterday_close_fn(ss.held_contract, prev_td)
+    # ── 雙源核對：上一交易日 FinMind 結算價 vs Shioaji 參考價（同為結算價）──
+    # 僅在 reference 確為前日結算時比對（日盤收盤後 reference 已滾動 → 跳過）。
+    if ref_trustworthy and prev_settlement_fn is not None \
+            and ss.last_official_date == prev_td:
+        sj_px = prev_settlement_fn(ss.held_contract)
         if sj_px and sj_px > 0:
             diff = abs(sj_px / ss.last_official_price - 1.0)
             if diff > config.DUAL_SOURCE_TOL:
                 ss.warnings.append(
                     f"雙源核對：{prev_td} FinMind 結算 {ss.last_official_price:.0f} vs "
-                    f"Shioaji 收盤 {sj_px:.0f}，差 {diff:.3%} > {config.DUAL_SOURCE_TOL:.1%}")
+                    f"Shioaji 參考價 {sj_px:.0f}，差 {diff:.3%} > {config.DUAL_SOURCE_TOL:.1%}")
 
     # ── 今日暫定列（預覽用；序列已含今日官方列則略過）──────────────────────
     if ss.last_official_date < today and today_price_fn is not None:
