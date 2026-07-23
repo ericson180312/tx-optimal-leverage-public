@@ -247,5 +247,7 @@ def decide(maximin: pd.DataFrame, cellpct: pd.DataFrame, *,
         "neighbor_table": pd.DataFrame(b_rows),
         "spike": bool(spike_any), "verdict_b": verdict_b,
         "plateau_by_pct": spread_pct < PLATEAU_TOL,
-        "plateau_by_raw": raw_spread_max < PLATEAU_TOL,
+        # robust 讀數以「代表性的中位數格」為準（max 只反映單一最噪的短期格，過嚴）
+        "plateau_by_raw": raw_spread_med < PLATEAU_TOL,
+        "plateau_by_raw_max": raw_spread_max < PLATEAU_TOL,
     }

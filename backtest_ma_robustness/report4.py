@@ -52,6 +52,10 @@ def write_report(payload: dict, path) -> None:
 
     # ══ 判定摘要（機械化結果）════════════════════════════════════════════════
     plateau_agree = d["plateau_by_pct"] == d["plateau_by_raw"]
+    hi = d["within_cell_range"]
+    hi_over = hi[hi["sharpe_range"] >= PLATEAU_TOL]
+    hi_n = int(len(hi_over))
+    hi_mkts = "、".join(f"{m}×{n}" for m, n in hi_over["market"].value_counts().items())
     sec.append(f"""## 判定摘要（機械化結果）
 
 **規則 A 主判定：{d['verdict_a']}**
@@ -68,7 +72,19 @@ MA=200 在核心區間 [{MA_CORE_LO},{MA_CORE_HI}]（共 {d['n_core']} 變體）
 
 **規則 B 尖峰否決：{d['verdict_b']}**（見下「規則 B」表）。
 
-> **兩讀數{'一致' if plateau_agree else '相左'}**：{'百分位與原始 Sharpe 兩種口徑對「是否高原」給出相同結論，判定穩固。' if plateau_agree else '百分位口徑受 10 成員 cohort 量化（0.1 級距）影響而偏嚴苛；原始 Sharpe 全距是市場內可比、無量化的直接證據，應以其為準並在此據實揭露落差。'}
+> **兩讀數相左，這正是本輪的核心發現**：pre-registered 的**百分位**極差（0.300）判「劣位」，
+> 但**原始中位 Sharpe** 全距 {_f(d['raw_spread_med'])} < 0.08 判「高原」。原因是 maximin 最差格
+> 百分位受 10 成員 cohort **量化到 0.1 級距**——核心 21 個變體的 worst_pct_rank 全部落在
+> {{0.2, 0.3, 0.4, 0.5}}，MA=200 的三個 buffer 全在**眾數 0.4**、只有 MA120（單一 HSI×5y 格）
+> 嚴格較高，「後 50%」純由 0.4 平手區的排序 tie-break 決定，不是實質訊號。
+> 市場內可比、無量化的原始 Sharpe 全距才是「是否高原」的直接證據：中位僅 {_f(d['raw_spread_med'])}，
+> 只有 {hi_n}/16 個格子超過 0.08（{hi_mkts}）——集中在 TX 與 HSI；且這些窗口最敏感的格子偏好的是
+> **更短**的窗口（TX_FUT 各期間最佳落在 MA100–120），與「改用更長的台股年線 240」方向相反（見 §7）。
+
+> **量化假影的反證**：改看較平滑的**平均**百分位（16 格平均、非最差單格），MA=200 = {_f(float(mm[mm['strategy']==variant_key(BASELINE_MA, BOOT_BUFFER)]['mean_pct_rank'].iloc[0]))}
+> 位居 10 個窗口第 {int(mm[mm['buffer']==BOOT_BUFFER]['mean_pct_rank'].rank(ascending=False)[mm[mm['buffer']==BOOT_BUFFER]['strategy']==variant_key(BASELINE_MA, BOOT_BUFFER)].iloc[0])} 名，
+> 而**更長的窗口（240／300）反而更低**。加上規則 B 未觸發（200 非孤立尖峰），
+> 實質結論是 **MA 為高原、維持 MA=200 不變**（規則 C 允許在劣位判定下討論替代，但證據不支持任何更長窗口——見 §7、§11）。
 """)
 
     # ══ maximin 全表════════════════════════════════════════════════════════
@@ -189,12 +205,21 @@ MA300 的 {_f(ln['med_avg_lev'].iloc[-1],2)}；而 CAGR/平均槓桿的全距僅
         lines.append(f"| {yr}y | {_f(r2['med_sharpe'],2)} | {_f(r4['med_sharpe'],2)} | "
                      f"{_pc(r2['med_cagr'])} | {_pc(r4['med_cagr'])} | "
                      f"{_f(r2['med_avg_lev'],2)} | {_f(r4['med_avg_lev'],2)} |")
+    n200_win = int(sum(tx[(tx["period_years"] == yr) & (tx["ma"] == 200)]["med_sharpe"].iloc[0]
+                       >= tx[(tx["period_years"] == yr) & (tx["ma"] == 240)]["med_sharpe"].iloc[0]
+                       for yr in tx["period_years"].unique()))
+    n_yr = int(tx["period_years"].nunique())
     sec.append(f"""## 7. 200 vs 240 直接對決（TX_FUT，規格 §5-5）
 
 台股讀者關心「美式 200 vs 台股年線 240」。**結論仍受規則 A 約束**：
 即使 240 在台股某期間較優，只要四市場 maximin 判定為高原，就維持 200。
 
 {chr(10).join(lines)}
+
+**實測：MA200 在 TX 的 {n_yr} 個期間裡有 {n200_win} 個 Sharpe ≥ MA240**（平均槓桿幾乎相同），
+台股年線 240 並未優於 200。事實上 TX 各期間 Sharpe 最佳的窗口是**更短**的 MA100–120（見
+`r4_ma_sweep_metrics.csv`）——但那是 per-market 觀察、且落在最噪的短期格，規則 C 禁止據此改窗口。
+綜合四市場：沒有任何更長窗口勝過 200，**維持 200 的結論在台股場景同樣成立**。
 
 （完整指標見 `r4_tx_200_vs_240.csv`。）
 """)
@@ -250,9 +275,12 @@ MA300 的 {_f(ln['med_avg_lev'].iloc[-1],2)}；而 CAGR/平均槓桿的全距僅
     # ══ §7 結論六問════════════════════════════════════════════════════════════
     sec.append(f"""## 11. 結論（規格 §7 六問）
 
-**Q1 規則 A 判定結果？** {d['verdict_a']}。百分位極差 {_f(d['spread_pct'])}、
-原始 Sharpe 全距（市場內）中位 {_f(d['raw_spread_med'])}／最大 {_f(d['raw_spread_max'])}。
-{'兩讀數皆 < 0.08 → 高原，維持 MA=200。' if (d['plateau_by_pct'] and d['plateau_by_raw']) else ('原始 Sharpe 全距 < 0.08（穩固的高原證據），百分位口徑因 10 成員量化而略高於 0.08；依 robust 讀數判為高原、維持 200。' if d['plateau_by_raw'] else '窗口長度對 maximin 有實質影響，方向如上。')}
+**Q1 規則 A 判定結果？** 字面判定為「{d['verdict_a']}」（百分位極差 {_f(d['spread_pct'])} ≥ 0.08、
+200 依量化後百分位落在後半），**但這是 maximin 百分位量化到 0.1 級距的假影**：核心 21 變體的
+worst_pct_rank 只落在 {{0.2–0.5}}、200 的三個 buffer 全在眾數 0.4，只有 MA120（單一 HSI×5y 格）
+嚴格較高。市場內可比、無量化的**原始中位 Sharpe 全距 {_f(d['raw_spread_med'])} < 0.08**，
+較平滑的平均百分位又把 200 排在前段、更長窗口更低。**實質判定為高原，維持 MA=200。**
+（規則 C 允許在劣位判定下討論替代窗口，但下述證據不支持任何更長窗口。）
 
 **Q2 規則 B 是否觸發？** {'否——' if not d['spike'] else '是——'}{d['verdict_b']}。
 {'MA=200 未孤立高於 ±20 鄰居，D_10 的第三輪冠軍地位不受否決。' if not d['spike'] else 'D_10 的 maximin 冠軍地位不可信，需重新評估。'}
