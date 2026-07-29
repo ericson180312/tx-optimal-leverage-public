@@ -8,7 +8,9 @@ __pycache__/
 shioaji.log
 
 # live 交易系統：秘密與執行期產物永不提交
-d10_trading/.env
+# .env* 涵蓋 .env / .env.bak / .env.local 等衍生檔；範本檔例外保留
+d10_trading/.env*
+!d10_trading/.env.example
 d10_trading/var/
 d10_trading/KILL_SWITCH
 
