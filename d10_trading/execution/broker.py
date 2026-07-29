@@ -46,6 +46,7 @@ class PositionInfo:
     quantity: int
     avg_price: float
     last_price: float = 0.0
+    pnl: float = 0.0          # 未實現損益（券商計算，已含正確乘數）
 
     @property
     def signed_qty(self) -> int:
@@ -288,14 +289,60 @@ class ShioajiBroker(BrokerInterface):
 
     # ── 帳務 ────────────────────────────────────────────────────────────────
     def equity(self) -> float:
-        """權益數（規格 §4）。模擬環境 margin() 回 0 → 退回 SIM_EQUITY。"""
+        """權益數（規格 §4）。
+
+        真實模式：券商權益數（margin().equity）。
+        模擬模式：Shioaji 模擬伺服器的 margin() 恆回 0，改以
+            **SIM_EQUITY（起始權益）＋累計已實現損益＋未實現損益** 逐日市值計價。
+        為何必須市值計價：若權益凍結在 SIM_EQUITY，下跌時目標口數 L×E/(價×乘數)
+        反而上升（愈跌愈買），與真實帳戶（權益隨虧損下降 → 目標口數下降）行為相反，
+        G1 在下跌段觀察到的行為將無法代表實盤（2026-07-30 檢討）。
+        已實現部分不可省略：每月轉倉會把未實現損益實現掉，只計未實現會讓權益
+        在轉倉日跳回起始值。
+        """
         m = _retry(lambda: self._api.margin(account=self._api.futopt_account),
                    "margin 查詢")
         eq = float(getattr(m, "equity", 0.0) or 0.0)
-        if eq <= 0 and self.simulation:
-            log.info("模擬環境權益數為 0，採用 SIM_EQUITY=%.0f", config.SIM_EQUITY)
-            return config.SIM_EQUITY
-        return eq
+        if eq > 0 or not self.simulation:
+            return eq
+
+        unreal = sum(p.pnl for p in self.positions())
+        real = self._realized_pnl()
+        total = config.SIM_EQUITY + real + unreal
+        log.info("模擬權益（市值計價）：起始 %.0f ＋已實現 %.0f ＋未實現 %.0f ＝ %.0f",
+                 config.SIM_EQUITY, real, unreal, total)
+        audit("sim_equity", base=config.SIM_EQUITY, realized=real,
+              unrealized=unreal, equity=total)
+        if total <= 0:
+            raise BrokerError(f"模擬權益已歸零或為負（{total:.0f}）——停止")
+        return total
+
+    def _realized_pnl(self) -> float:
+        """模擬帳戶的累計已實現損益（paper P&L 端點）。僅模擬模式使用。
+
+        只計 **SIM_PNL_SINCE 起、且屬 PRODUCT** 的紀錄——模擬帳戶可能殘留
+        本系統之外的活動（實測：2026-07-16 API 開通測試單 TXFH6 留下
+        −235,000），計入會讓 G1 權益失真。查詢失敗 → 回 0 並告警。
+        """
+        def _do():
+            rows = self._api.list_profit_loss(
+                account=self._api.futopt_account,
+                begin_date=config.SIM_PNL_SINCE,
+                end_date=dt.date.today().isoformat())
+            total = 0.0
+            for r in rows:
+                code = str(getattr(r, "code", "") or "")
+                if not code.startswith(config.PRODUCT):
+                    log.info("模擬已實現損益：略過非 %s 紀錄 %s（%s）",
+                             config.PRODUCT, code, getattr(r, "pnl", ""))
+                    continue
+                total += float(getattr(r, "pnl", 0.0) or 0.0)
+            return total
+        try:
+            return _retry(_do, "已實現損益查詢")
+        except Exception:  # noqa: BLE001 - 模擬權益輔助查詢，不可中斷批次
+            log.warning("已實現損益查詢失敗，模擬權益暫未計入已實現部分")
+            return 0.0
 
     def positions(self) -> list[PositionInfo]:
         def _do():
@@ -306,7 +353,8 @@ class ShioajiBroker(BrokerInterface):
                     direction=str(getattr(p.direction, "value", p.direction)),
                     quantity=int(p.quantity),
                     avg_price=float(getattr(p, "price", 0.0) or 0.0),
-                    last_price=float(getattr(p, "last_price", 0.0) or 0.0)))
+                    last_price=float(getattr(p, "last_price", 0.0) or 0.0),
+                    pnl=float(getattr(p, "pnl", 0.0) or 0.0)))
             return out
         return _retry(_do, "持倉查詢")
 
