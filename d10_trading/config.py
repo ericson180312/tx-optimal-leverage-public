@@ -93,9 +93,16 @@ ROLL_USE_COMBO = True        # 優先用 TAIFEX 跨月價差單；失敗退回�
 LIVE_TRADING = False         # G2 之前絕不改 True；True = 真實資金下單
 SIMULATION = not LIVE_TRADING
 
-# 模擬環境的 margin() 回傳 0（Shioaji 模擬伺服器不提供權益數），
-# G1 期間以此常數作為名目權益供口數計算；真實模式一律用 API 權益數。
+# 模擬環境的 margin() 回傳 0（Shioaji 模擬伺服器不提供權益數）。
+# 此常數為模擬帳戶的**起始權益**；實際使用的權益 = SIM_EQUITY ＋累計已實現損益
+# ＋未實現損益（逐日市值計價，見 broker.equity），使模擬的曝險調整行為與真實
+# 帳戶一致。真實模式一律用 API 權益數，不使用此常數。
 SIM_EQUITY = float(os.environ.get("SIM_EQUITY", "700000"))
+# 模擬權益的「起算日」：SIM_EQUITY 是此日的權益，僅計入此日起、且屬本商品
+# （PRODUCT）的已實現損益。用意是排除本系統之外的模擬帳戶活動——實測
+# 2026-07-16 的 API 開通測試單（TXFH6 1 口）留下 −235,000 已實現損益，
+# 若一併計入會讓 G1 權益憑空少 33%（2026-07-30 發現）。
+SIM_PNL_SINCE = "2026-07-20"   # G1 首個交易日（本系統首次建倉）
 
 # ── 認證（一律環境變數，永不落地程式碼/日誌）────────────────────────────────
 SJ_API_KEY = os.environ.get("SJ_API_KEY", "")
