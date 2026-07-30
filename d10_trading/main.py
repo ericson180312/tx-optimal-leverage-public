@@ -23,7 +23,7 @@ from d10_trading.data.calendar import CalendarCoverageError
 from d10_trading.data.series import DataStaleError, prepare_series
 from d10_trading.execution import orders
 from d10_trading.execution.broker import BrokerInterface, ShioajiBroker
-from d10_trading.ops import notify, oplog, reconcile as rc, state as state_mod
+from d10_trading.ops import notify, oplog, reconcile as rc, state as state_mod, watchdog
 from d10_trading.ops.audit import audit
 from d10_trading.ops.state import PositionState
 from d10_trading.strategy import regime, sizing
@@ -108,6 +108,9 @@ def _run_daily(broker: BrokerInterface, *, today: dt.date | None = None,
 
 def _run_core(broker: BrokerInterface, st, today, now, dry_run, ignore_window,
               fetch_kwargs, sleep_fn, warnings: list[str]) -> int:
+    # ── 0. 到期哨兵（置於登入前：登入失敗的日子也要能收到提醒）──────────────
+    _check_expiries(today, warnings)
+
     # ── 1. 連線與對帳（reconcile）───────────────────────────────────────────
     from d10_trading.execution.broker import BrokerError
     try:
@@ -337,6 +340,24 @@ def _run_core(broker: BrokerInterface, st, today, now, dry_run, ignore_window,
         return exit_code
     finally:
         broker.logout()
+
+
+def _check_expiries(today: dt.date, warnings: list[str]) -> None:
+    """到期哨兵（ops/watchdog.py）。哨兵本身故障絕不影響交易。"""
+    try:
+        items = watchdog.check_expiries(today)
+    except Exception as e:  # noqa: BLE001
+        log.warning("到期檢查失敗（忽略）：%s", type(e).__name__)
+        return
+    for item in items:
+        msg = item.message()
+        warnings.append(msg)                       # 一律入每日摘要
+        audit("expiry_check", name=item.name, deadline=item.deadline.isoformat(),
+              days_left=item.days_left, level=item.level)
+        if watchdog.should_push(item, today):      # WARNING 每週一、ALERT 每日
+            notify.send(item.level, msg)
+        else:
+            log.info("到期提醒（未推播）：%s", msg)
 
 
 def _check_ca(broker: BrokerInterface) -> None:

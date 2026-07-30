@@ -42,6 +42,12 @@ def _load_holiday_file() -> tuple[frozenset[dt.date], frozenset[int]]:
     return frozenset(holidays), frozenset(covered)
 
 
+def covered_years() -> frozenset[int]:
+    """假日檔涵蓋的年份集合（到期哨兵用；見 ops/watchdog.py）。"""
+    _, covered = _load_holiday_file()
+    return covered
+
+
 def _require_coverage(d: dt.date) -> None:
     _, covered = _load_holiday_file()
     if d.year not in covered:

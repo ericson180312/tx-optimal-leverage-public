@@ -11,6 +11,7 @@
 """
 from __future__ import annotations
 
+import datetime as dt
 import os
 from pathlib import Path
 
@@ -121,6 +122,21 @@ HEALTHCHECK_URL = os.environ.get("HEALTHCHECK_URL", "")
 # CA 憑證到期預警（僅真實模式；需身分證字號查詢，空 = 略過檢查）
 SJ_PERSON_ID = os.environ.get("SJ_PERSON_ID", "")
 CA_EXPIRY_WARN_DAYS = 30
+
+# ── 到期哨兵（§7 可觀測性）──────────────────────────────────────────────────
+# 會讓系統停擺的外部到期事項；日批次每日檢查並提前預警（ops/watchdog.py）。
+# 假日檔涵蓋年份自 data_static/taifex_holidays.csv 的 covered_years 自動推導，
+# 不必列在此表——它是唯一「到期即 fail-closed、完全不跑」的項目。
+# 🔴 CA 憑證：真實模式另有 broker.ca_expiry_days() 向券商查詢（更權威）；
+#    但模擬模式查不到（CaError: CA not activated，2026-07-30 實測），
+#    故 G1 期間本表是唯一可見性。續期後記得同步更新此處日期。
+EXPIRY_DATES: dict[str, dt.date] = {
+    "永豐 CA 憑證":     dt.date(2028, 7, 15),
+    "Shioaji API 金鑰": dt.date(2027, 7, 15),
+    "Vultr 信用卡":     dt.date(2031, 10, 31),   # 卡片於當月月底失效
+}
+EXPIRY_WARN_DAYS = 60        # ≤60 天 → WARNING（每週一推播，避免告警疲勞）
+EXPIRY_ALERT_DAYS = 14       # ≤14 天 → ALERT（每日推播）；已過期 → CRITICAL
 
 # ── API 重試（§10）───────────────────────────────────────────────────────────
 RETRY_MAX = 3                # 查詢類 API 重試上限（指數退避）；下單不盲重試
