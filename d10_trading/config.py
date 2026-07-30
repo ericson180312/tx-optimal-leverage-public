@@ -138,6 +138,15 @@ EXPIRY_DATES: dict[str, dt.date] = {
 EXPIRY_WARN_DAYS = 60        # ≤60 天 → WARNING（每週一推播，避免告警疲勞）
 EXPIRY_ALERT_DAYS = 14       # ≤14 天 → ALERT（每日推播）；已過期 → CRITICAL
 
+# ── 假日檔自動更新（data/holiday_sync.py）───────────────────────────────────
+# TWSE 開休市日期 API（參數為 date=YYYYMMDD；queryYear 會被忽略，實測 2026-07-30）。
+# 交易所約每年秋季才公告次年行事曆，故進入預警窗後每日嘗試、抓到為止。
+# 🔴 官方年度表**不含臨時停市（颱風）**，故一律 additive merge，絕不覆蓋刪除。
+TWSE_HOLIDAY_API = "https://www.twse.com.tw/rwd/zh/holidaySchedule/holidaySchedule"
+HOLIDAY_SYNC_ENABLED = True
+HOLIDAY_MIN_DAYS = 10        # 健全性：一年平日休市數合理區間（2025/2026 實測皆 18）
+HOLIDAY_MAX_DAYS = 25
+
 # ── API 重試（§10）───────────────────────────────────────────────────────────
 RETRY_MAX = 3                # 查詢類 API 重試上限（指數退避）；下單不盲重試
 RETRY_BASE_SECS = 1.0

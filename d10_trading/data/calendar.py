@@ -103,6 +103,34 @@ def settlement_date(year: int, month: int) -> dt.date:
     return d
 
 
+def reload() -> None:
+    """清除假日檔快取（holiday_sync 寫入後呼叫，使新資料立即生效）。"""
+    _load_holiday_file.cache_clear()
+
+
+def find_adhoc_closures(actual_days: list[dt.date],
+                        since: dt.date) -> list[dt.date]:
+    """臨時停市（颱風等）：平日、不在假日檔、卻無實際行情的日期。
+
+    只檢查「實際行情資料範圍之內」的日期——區間為 [max(since, 首個實際行情日),
+    最後實際行情日]。兩端都夾在真實資料內，因此：
+    - 不會把資料延遲的最新日誤判為停市（其後無行情佐證）；
+    - 也不會把資料起點之前的平日全部誤判（since 早於資料起點時）。
+    被標記者必然前後都有行情佐證。
+    """
+    holidays, covered = _load_holiday_file()
+    actual = {d for d in actual_days if d >= since}
+    if not actual:
+        return []
+    out, cur, end = [], max(since, min(actual)), max(actual)
+    while cur <= end:
+        if (cur.year in covered and cur.weekday() < 5
+                and cur not in holidays and cur not in actual):
+            out.append(cur)
+        cur += dt.timedelta(days=1)
+    return out
+
+
 def validate_against_actual(actual_days: list[dt.date],
                             since: dt.date) -> list[str]:
     """假日檔 vs 實際行情日互驗（只驗 since 之後、且在涵蓋年份內的日期）。

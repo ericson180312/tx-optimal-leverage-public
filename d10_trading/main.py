@@ -18,7 +18,7 @@ import time
 from zoneinfo import ZoneInfo
 
 from d10_trading import config
-from d10_trading.data import calendar
+from d10_trading.data import calendar, holiday_sync
 from d10_trading.data.calendar import CalendarCoverageError
 from d10_trading.data.series import DataStaleError, prepare_series
 from d10_trading.execution import orders
@@ -168,6 +168,18 @@ def _run_core(broker: BrokerInterface, st, today, now, dry_run, ignore_window,
         warnings.extend(ss.warnings)
         for w in ss.warnings:
             notify.send("WARNING", w)
+
+        # 臨時停市自動補登（過去日期，前後皆有實際行情佐證；只增不刪）。
+        # 未及時補登會使 prev_trading_day 誤判、序列插入假的一天並偏移訊號相位。
+        adhoc = holiday_sync.record_adhoc_closures(
+            ss.dates, since=today - dt.timedelta(days=90))
+        if adhoc:
+            msg = ("假日檔已自動補登臨時停市："
+                   + "、".join(d.isoformat() for d in adhoc)
+                   + "（依實際行情無交易判定，請與 TAIFEX 公告核對）")
+            warnings.append(msg)
+            audit("adhoc_closure_recorded", dates=[d.isoformat() for d in adhoc])
+            notify.send("WARNING", msg)
 
         lev, _ = regime.compute_regime(ss.spot)
         exec_idx = ss.exec_index(today)          # T+1：嚴格早於今日的最後官方列
@@ -343,7 +355,25 @@ def _run_core(broker: BrokerInterface, st, today, now, dry_run, ignore_window,
 
 
 def _check_expiries(today: dt.date, warnings: list[str]) -> None:
-    """到期哨兵（ops/watchdog.py）。哨兵本身故障絕不影響交易。"""
+    """到期哨兵（ops/watchdog.py）。哨兵本身故障絕不影響交易。
+
+    進入假日檔預警窗時，先嘗試自 TWSE 自動補次年度（additive-only）；
+    補成功後涵蓋年份延長，該項提醒自然消失。
+    """
+    try:
+        res = holiday_sync.auto_sync_if_needed(today)
+        if res.status == "added":
+            audit("holiday_sync", year=res.year,
+                  added=[d.isoformat() for d in res.added])
+            notify.send("INFO", res.message())
+        elif res.status == "failed":
+            audit("holiday_sync_failed", year=res.year, detail=res.detail)
+            notify.send("WARNING", res.message())
+        elif res.status == "unavailable":
+            log.info("%s", res.detail)            # 尚未公告屬正常，不推播
+    except Exception as e:  # noqa: BLE001 - 自動更新故障不得影響交易
+        log.warning("假日檔自動更新異常（忽略）：%s", type(e).__name__)
+
     try:
         items = watchdog.check_expiries(today)
     except Exception as e:  # noqa: BLE001
