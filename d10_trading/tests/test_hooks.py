@@ -8,11 +8,22 @@ from d10_trading.ops import notify
 from d10_trading.tests.test_integration import run, setup_scenario
 
 
-def _capture_pings(monkeypatch):
+class _Resp:
+    """最小 requests 回應樁（心跳只讀 status_code）。"""
+
+    def __init__(self, status_code=200):
+        self.status_code = status_code
+
+
+def _capture_pings(monkeypatch, status=200):
     calls: list[str] = []
+
+    def fake_get(url, timeout=0):
+        calls.append(url)
+        return _Resp(status)
+
     monkeypatch.setattr(config, "HEALTHCHECK_URL", "https://hc.example/ping")
-    monkeypatch.setattr(notify.requests, "get",
-                        lambda url, timeout=0: calls.append(url))
+    monkeypatch.setattr(notify.requests, "get", fake_get)
     return calls
 
 
@@ -49,6 +60,33 @@ def test_heartbeat_failure_never_breaks_batch(monkeypatch):
 
     monkeypatch.setattr(notify.requests, "get", boom)
     assert run(broker) == 0                       # ping 失敗不影響批次結果
+
+
+def test_heartbeat_rejected_status_raises_alert(monkeypatch):
+    """🔴 URL 失效時 healthchecks 回 404——必須告警，不可假裝正常。
+
+    否則外部缺席偵測早已失效卻無人察覺（監控系統本身故障的盲點）。
+    """
+    _capture_pings(monkeypatch, status=404)
+    sent: list[tuple[str, str]] = []
+    monkeypatch.setattr(notify, "_telegram", lambda text: sent.append(text) or True)
+    notify.heartbeat(0)
+    assert sent and "HTTP 404" in sent[0] and "不可信" in sent[0]
+
+
+def test_heartbeat_non_response_object_never_propagates(monkeypatch):
+    """回應物件無 status_code（樁/代理異常）也不得穿透到批次流程。"""
+    monkeypatch.setattr(config, "HEALTHCHECK_URL", "https://hc.example/ping")
+    monkeypatch.setattr(notify.requests, "get", lambda url, timeout=0: None)
+    notify.heartbeat(0)                       # 不拋出即通過
+
+
+def test_heartbeat_ok_status_sends_no_alert(monkeypatch):
+    _capture_pings(monkeypatch, status=200)
+    sent: list[str] = []
+    monkeypatch.setattr(notify, "_telegram", lambda text: sent.append(text) or True)
+    notify.heartbeat(0)
+    assert sent == []                         # 200 → 靜默
 
 
 def test_heartbeat_skipped_when_unset(monkeypatch):

@@ -54,6 +54,11 @@ def heartbeat(exit_code: int) -> None:
     """healthchecks.io 心跳：批次結尾必 ping（含假日快速退出），
     讓「排程沒跑」與「跑了但異常」都能被外部監控偵測。
     未設定 HEALTHCHECK_URL 即略過；ping 失敗絕不影響批次結果。
+
+    🔴 必須檢查 HTTP 回應碼：URL 打錯或 check 被刪除時 healthchecks 回 404，
+    若只看有無例外會一路記成「ping OK」——監控早已失效卻無人察覺
+    （「監控系統本身故障」的典型盲點）。非 200 一律升級為 ALERT，
+    因為此時外部監控已不可信，缺席偵測形同虛設。
     """
     if not config.HEALTHCHECK_URL:
         return
@@ -61,10 +66,21 @@ def heartbeat(exit_code: int) -> None:
     if exit_code != 0:
         url += "/fail"
     try:
-        requests.get(url, timeout=10)
+        # 取值一併放進 try：任何非預期回應都在此被吸收，絕不穿透到批次流程
+        status = requests.get(url, timeout=10).status_code
+    except Exception as e:  # noqa: BLE001 - 心跳失敗不可拖垮批次
+        log.warning("heartbeat ping 失敗（忽略）：%s", type(e).__name__)
+        audit("heartbeat_failed", reason=type(e).__name__, exit_code=exit_code)
+        return
+    if status == 200:
         log.info("heartbeat ping OK（exit=%d）", exit_code)
-    except Exception:  # noqa: BLE001 - 心跳失敗不可拖垮批次
-        log.warning("heartbeat ping 失敗（忽略）")
+        return
+    # 送達了但被拒——URL 失效的機率遠高於服務異常，需人工確認
+    log.error("heartbeat 被拒：HTTP %s", status)
+    audit("heartbeat_rejected", status=status, exit_code=exit_code)
+    send("ALERT", f"healthchecks 心跳被拒（HTTP {status}）——"
+                  "URL 可能失效或 check 已刪除，外部缺席偵測目前不可信，"
+                  "請至 healthchecks.io 確認後更新 .env 的 HEALTHCHECK_URL")
 
 
 def setup_logging() -> None:
