@@ -131,6 +131,7 @@ def _run_core(broker: BrokerInterface, st, today, now, dry_run, ignore_window,
         if len(recon.held_months) > 1:
             raise DayStop(f"持倉橫跨多個月份 {recon.held_months}——"
                           "前日轉倉可能不完整，請人工處理")
+        _check_risk_indicator(broker, warnings)
 
         # ── 2. 保險絲前置檢查（§7：對帳後）────────────────────────────────
         held_month = recon.held_months[0] if recon.held_months else None
@@ -388,6 +389,30 @@ def _check_expiries(today: dt.date, warnings: list[str]) -> None:
             notify.send(item.level, msg)
         else:
             log.info("到期提醒（未推播）：%s", msg)
+
+
+def _check_risk_indicator(broker: BrokerInterface, warnings: list[str]) -> None:
+    """風險指標監控（僅真實模式有值）——保證金充足度的異常金絲雀。
+
+    正常值約 1,600–2,700%（2 倍槓桿、全額入金），故任何接近門檻的讀數都代表
+    口數、保證金率或權益出現非預期變化。查詢失敗不影響交易。
+    """
+    ri = broker.risk_indicator()
+    if ri is None:
+        return
+    audit("risk_indicator", value=round(ri, 1))
+    if ri < config.RISK_INDICATOR_CRITICAL:
+        level, note = "CRITICAL", "已逼近保證金不足，請立即確認帳戶並補繳"
+    elif ri < config.RISK_INDICATOR_ALERT:
+        level, note = "ALERT", "低於補款門檻，請確認是否需補入資金"
+    elif ri < config.RISK_INDICATOR_WARN:
+        level, note = "WARNING", "顯著低於常態（約 1,600%+），請確認口數與保證金率"
+    else:
+        log.info("風險指標 %.0f%%（正常）", ri)
+        return
+    msg = f"風險指標 {ri:.0f}%——{note}"
+    warnings.append(msg)
+    notify.send(level, msg)
 
 
 def _check_ca(broker: BrokerInterface) -> None:

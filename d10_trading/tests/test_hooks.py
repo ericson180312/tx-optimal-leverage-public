@@ -128,3 +128,56 @@ def test_ca_check_silent_when_ok_or_unavailable(monkeypatch):
     main_mod._check_ca(_stub_broker(200))         # 距到期尚遠
     main_mod._check_ca(_stub_broker(None))        # 模擬模式/未設 person_id
     assert sent == []
+
+
+# ── 風險指標監控 ─────────────────────────────────────────────────────────────
+
+def _stub_risk(value):
+    return SimpleNamespace(risk_indicator=lambda: value)
+
+
+def _capture_sends(monkeypatch):
+    sent: list[tuple[str, str]] = []
+    monkeypatch.setattr(main_mod.notify, "send",
+                        lambda level, text: sent.append((level, text)))
+    return sent
+
+
+def test_risk_indicator_levels(monkeypatch):
+    """正常值靜默；低於各門檻依序 WARNING / ALERT / CRITICAL。"""
+    cases = [
+        (2400.0, None),          # 常態（2 倍槓桿全額入金）
+        (500.0, None),           # 恰在門檻上 → 不告警
+        (499.0, "WARNING"),
+        (200.0, "WARNING"),      # 恰在 ALERT 門檻上 → 仍為 WARNING
+        (199.0, "ALERT"),
+        (100.0, "ALERT"),        # 恰在 CRITICAL 門檻上
+        (99.0, "CRITICAL"),
+    ]
+    for value, expect in cases:
+        sent = _capture_sends(monkeypatch)
+        warnings: list[str] = []
+        main_mod._check_risk_indicator(_stub_risk(value), warnings)
+        if expect is None:
+            assert sent == [], f"{value}% 不應告警"
+            assert warnings == []
+        else:
+            assert sent and sent[0][0] == expect, f"{value}% 應為 {expect}"
+            assert f"{value:.0f}%" in sent[0][1]
+            assert warnings, "應併入每日摘要"
+
+
+def test_risk_indicator_silent_when_unavailable(monkeypatch):
+    """模擬模式／查詢失敗回 None → 完全靜默（G1 期間即為此情形）。"""
+    sent = _capture_sends(monkeypatch)
+    warnings: list[str] = []
+    main_mod._check_risk_indicator(_stub_risk(None), warnings)
+    assert sent == [] and warnings == []
+
+
+def test_broker_risk_indicator_none_in_simulation():
+    """模擬模式不查（margin() 恆回 0）。"""
+    from d10_trading.execution.broker import ShioajiBroker
+    b = ShioajiBroker.__new__(ShioajiBroker)
+    b.simulation = True
+    assert b.risk_indicator() is None

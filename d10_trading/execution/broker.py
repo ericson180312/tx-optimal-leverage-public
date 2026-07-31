@@ -92,6 +92,10 @@ class BrokerInterface:
         """CA 憑證剩餘天數；不可用（模擬/未設 person_id/查詢失敗）回 None。"""
         return None
 
+    def risk_indicator(self) -> float | None:
+        """風險指標（百分比數值）；不可用（模擬/查詢失敗）回 None。"""
+        return None
+
     def place_limit(self, code: str, action: str, quantity: int,
                     price: float) -> OrderHandle: raise NotImplementedError
     def place_combo_roll(self, sell_code: str, buy_code: str, quantity: int,
@@ -316,6 +320,24 @@ class ShioajiBroker(BrokerInterface):
         if total <= 0:
             raise BrokerError(f"模擬權益已歸零或為負（{total:.0f}）——停止")
         return total
+
+    def risk_indicator(self) -> float | None:
+        """風險指標＝權益數 ÷ 未沖銷部位維持保證金 ×100%（券商計算）。
+
+        模擬模式 margin() 恆回 0（含本欄）→ 回 None 略過檢查，與 CA 到期
+        查詢同樣屬「G2′ 起才有可見性」的項目。查詢失敗亦回 None（監控功能
+        失效不得影響交易）。
+        """
+        if self.simulation:
+            return None
+        try:
+            m = _retry(lambda: self._api.margin(account=self._api.futopt_account),
+                       "margin 查詢（風險指標）")
+            v = float(getattr(m, "risk_indicator", 0.0) or 0.0)
+        except Exception as e:  # noqa: BLE001 - 監控查詢失敗不影響交易
+            log.warning("風險指標查詢失敗（忽略）：%s", type(e).__name__)
+            return None
+        return v if v > 0 else None
 
     def _realized_pnl(self) -> float:
         """模擬帳戶的累計已實現損益（paper P&L 端點）。僅模擬模式使用。

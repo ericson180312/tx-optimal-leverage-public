@@ -123,6 +123,17 @@ HEALTHCHECK_URL = os.environ.get("HEALTHCHECK_URL", "")
 SJ_PERSON_ID = os.environ.get("SJ_PERSON_ID", "")
 CA_EXPIRY_WARN_DAYS = 30
 
+# ── 風險指標監控（僅真實模式；margin().risk_indicator）─────────────────────
+# 風險指標 = 權益數 ÷ 未沖銷部位維持保證金 ×100%。本策略全額入金、2 倍槓桿下
+# 保證金僅佔權益 4–6%，正常值約 1,600–2,700%——門檻設在遠低於此，功能是
+# 「異常金絲雀」：口數算錯、期交所大幅調升保證金、或劇烈虧損時提前示警。
+# 200% 沿用使用者原人工操作的補款門檻；100% 已逼近保證金不足（<25% 會被代沖銷）。
+# ⚠️ G2′ 首次實跑請與券商 App 顯示的風險指標對照，確認單位一致（本系統假設為
+#    百分比數值，如 1650.0 表示 1650%）。模擬模式 margin() 回 0 → 略過檢查。
+RISK_INDICATOR_WARN = 500.0
+RISK_INDICATOR_ALERT = 200.0
+RISK_INDICATOR_CRITICAL = 100.0
+
 # ── 到期哨兵（§7 可觀測性）──────────────────────────────────────────────────
 # 會讓系統停擺的外部到期事項；日批次每日檢查並提前預警（ops/watchdog.py）。
 # 假日檔涵蓋年份自 data_static/taifex_holidays.csv 的 covered_years 自動推導，
