@@ -52,6 +52,7 @@ class CondResult:
     cost_cum: np.ndarray   # (P,) 累計成本（含建倉、轉倉）
     fuse_trig: np.ndarray  # (P,) F1/B2 保險絲減碼觸發次數
     bankrupt: np.ndarray   # (P,) bool
+    liquidated: np.ndarray | None = None   # (P,) bool：維持保證金強制平倉（第五輪新增）
 
 
 def _bcast(x, shape) -> np.ndarray:
@@ -70,6 +71,7 @@ def simulate(strategy: dict, ret: np.ndarray, *,
              price: np.ndarray | None = None, is_roll: np.ndarray | None = None,
              p_near: np.ndarray | None = None, p_next: np.ndarray | None = None,
              entry_price: np.ndarray | None = None,
+             maint_margin_rate: float = 0.0,
              e0: float = INITIAL_EQUITY) -> CondResult:
     """模擬單一策略在 (T,P) 報酬矩陣上的表現。
 
@@ -114,6 +116,7 @@ def simulate(strategy: dict, ret: np.ndarray, *,
     cost_cum = entry_cost.copy()
 
     dead = np.zeros(P, dtype=bool)
+    liq = np.zeros(P, dtype=bool)
     n_adj = np.zeros(P, dtype=np.int64)
     fuse_trig = np.zeros(P, dtype=np.int64)
     eq = np.empty((T, P))
@@ -133,6 +136,21 @@ def simulate(strategy: dict, ret: np.ndarray, *,
             dead |= d
             E[dead] = 0.0
             N[dead] = 0.0
+
+    def _margin_call():
+        """維持保證金強制平倉（第五輪新增；maint_margin_rate=0 時完全停用）。
+
+        觸發條件：帳戶權益 < 維持保證金需求（= maint_margin_rate × 名目部位）。
+        觸發時全數平倉：曝險歸零、權益保留當下剩餘值，其後永遠不再進場
+        （沿用破產的不可反彈紀律；liquidated 與 bankrupt 分開計數）。
+        """
+        nonlocal liq
+        if maint_margin_rate <= 0.0:
+            return
+        hit = (~dead) & (~liq) & (E < maint_margin_rate * np.abs(N))
+        if hit.any():
+            liq |= hit
+            N[liq] = 0.0
 
     for t in range(T):
         # 1. 結算＋計息／融資
@@ -154,6 +172,9 @@ def simulate(strategy: dict, ret: np.ndarray, *,
                 E -= rc
                 cost_cum += rc
                 _wipe()
+
+        # 3b. 維持保證金檢查（第五輪新增；預設停用）——結算與轉倉成本後、再平衡前
+        _margin_call()
 
         # 4. 觸價槓桿
         L = np.divide(N, E, out=np.zeros(P), where=E > 0)
@@ -182,6 +203,7 @@ def simulate(strategy: dict, ret: np.ndarray, *,
         else:                                              # cppi
             do = (np.abs(pending - L) > DEADBAND) & ~dead
             tgt = pending
+        do &= ~liq          # 強制平倉後永不再進場（liq 全 False 時為 no-op）
         if do.any():
             Ntgt = tgt * E
             dN = np.abs(Ntgt - N)
@@ -208,7 +230,7 @@ def simulate(strategy: dict, ret: np.ndarray, *,
         lev[t] = np.divide(N, E, out=np.zeros(P), where=E > 0)
 
     return CondResult(eq=eq, lev=lev, n_adj=n_adj, cost_cum=cost_cum,
-                      fuse_trig=fuse_trig, bankrupt=dead)
+                      fuse_trig=fuse_trig, bankrupt=dead, liquidated=liq)
 
 
 # ── 指標（規格 §7：沿用前輪全套，另加三項）──────────────────────────────────
@@ -265,6 +287,9 @@ def path_metrics(res: CondResult, rf_dep, *, e0: float = INITIAL_EQUITY) -> pd.D
         "time_derisked": (lev < DERISK_LEV).mean(axis=0),
         "n_adj": res.n_adj, "cost_ratio": res.cost_cum / e0,
         "fuse_trig": res.fuse_trig, "bankrupt": res.bankrupt,
+        # 第五輪新增：維持保證金強制平倉旗標（未啟用保證金模型時恆 False）
+        "liquidated": (res.liquidated if res.liquidated is not None
+                       else np.zeros(P, dtype=bool)),
     })
     out.loc[out["bankrupt"], ["sharpe", "sortino", "calmar"]] = np.nan
     return out
