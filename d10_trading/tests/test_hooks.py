@@ -146,9 +146,10 @@ def _capture_sends(monkeypatch):
 def test_risk_indicator_levels(monkeypatch):
     """正常值靜默；低於各門檻依序 WARNING / ALERT / CRITICAL。"""
     cases = [
-        (2400.0, None),          # 常態（2 倍槓桿全額入金）
-        (500.0, None),           # 恰在門檻上 → 不告警
-        (499.0, "WARNING"),
+        (688.0, None),           # 常態結構值（BULL L=2，見 config 註解）
+        (516.0, None),           # 常態最低（2 口區間下緣）→ 必須靜默
+        (350.0, None),           # 恰在門檻上 → 不告警
+        (349.0, "WARNING"),
         (200.0, "WARNING"),      # 恰在 ALERT 門檻上 → 仍為 WARNING
         (199.0, "ALERT"),
         (100.0, "ALERT"),        # 恰在 CRITICAL 門檻上
@@ -181,3 +182,20 @@ def test_broker_risk_indicator_none_in_simulation():
     b = ShioajiBroker.__new__(ShioajiBroker)
     b.simulation = True
     assert b.risk_indicator() is None
+
+
+def test_risk_thresholds_keep_margin_below_normal_range():
+    """🔴 門檻必須明顯低於常態最低值，否則整數捨入就會誤報（2026-08-01 修正）。
+
+    RI ≈ CV/(L×M)，與權益無關；常態最低出現在各口數區間的權益下緣。
+    以實際保證金推算，BULL 2 口下緣 ≈516%——若門檻貼太近（原設 500%）
+    正常運作即會觸發，導致告警疲勞、真正異常時被忽略。
+    """
+    CV = 43_727.0 * 10.0                       # TMF 契約價值（現價量級）
+    M = config.TMF_MARGIN_REF
+    normal_min = min((n - 0.5) * CV / 2.0 / (n * M) * 100 for n in (2, 3, 4))
+    assert 500 < normal_min < 600, f"常態最低 {normal_min:.0f}% 與註解不符，請重估門檻"
+    assert config.RISK_INDICATOR_WARN < normal_min * 0.75, (
+        f"WARNING={config.RISK_INDICATOR_WARN}% 距常態最低 {normal_min:.0f}% 太近，會誤報")
+    assert (config.RISK_INDICATOR_CRITICAL < config.RISK_INDICATOR_ALERT
+            < config.RISK_INDICATOR_WARN), "門檻順序錯誤"
