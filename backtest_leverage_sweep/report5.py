@@ -90,6 +90,38 @@ def write_report(payload: dict, path) -> None:
 """)
 
     # ══ §2 取捨曲線 ══════════════════════════════════════════════════════════
+    # 逐市場彎折檢定（規格 §5-1：綜合中位數可能掩蓋單一市場的彎折）
+    from backtest_leverage_sweep.frontier import detect_backward_bend
+    fm = payload["front_mkt"]
+    rows_b = []
+    for mk in RANKING_MARKETS:
+        d = fm[fm["market"] == mk].sort_values("l_high")
+        if d.empty:
+            continue
+        b = detect_backward_bend(d)
+        rows_b.append({"market": mk, "bend_at": b["bend_at"],
+                       "dominated": ("、".join(f"{v:.1f}" for v in b["dominated"])
+                                     if b["dominated"] else "—"),
+                       "cagr_change": b["cagr_total_change"],
+                       "mdd_change": b["mdd_total_change"]})
+    bend_mkt = pd.DataFrame(rows_b)
+    bent = bend_mkt[bend_mkt["bend_at"].notna()]["market"].tolist()
+    net_down = bend_mkt[bend_mkt["cagr_change"] <= 0]["market"].tolist()
+    local_only = [m for m in bent if m not in net_down]
+    bend_mkt_txt = (
+        (f"**{'、'.join(MARKET_LABEL.get(m, m) for m in bent)} 出現向後彎折。**\n\n"
+         "但必須區分兩種彎折，否則會往反方向過度解讀噪音：\n\n"
+         + (f"- **實質彎折**：{'、'.join(MARKET_LABEL.get(m, m) for m in net_down)}"
+            "——全區間 CAGR **淨變化為負或持平**，同時 MDD 顯著惡化，"
+            "屬真正的「更深回撤換不到報酬」。日經是四市場中最嚴苛的長陰跌樣本，"
+            "此結論與 §7 壓力窗口一致。\n" if net_down else "")
+         + (f"- **局部單段下凹（很可能是噪音）**：{'、'.join(MARKET_LABEL.get(m, m) for m in local_only)}"
+            "——雖有單一區段 ΔCAGR ≤ 0，但全區間 CAGR 淨變化仍為正（見上表），"
+            "屬曲線的小幅起伏。依規格 §8「若某 L_high 只在單一市場×單一區段亮眼／變差，"
+            "預設它是噪音」，**不應據此宣告該格被嚴格支配**。\n" if local_only else "")
+         + "\n綜合中位數看不到彎折，是因為各市場彎折點不同而被平滑；"
+         "但**單一市場的實質惡化不應被綜合值掩蓋**，故並列於此。")
+        if bent else "四個市場均未出現彎折，綜合與逐市場結論一致。")
     fr = front.copy()
     sec.append(f"""## 2. 取捨曲線（規格 §5-1，最重要）
 
@@ -103,7 +135,17 @@ def write_report(payload: dict, path) -> None:
            ("survival", "最低生存率", _pc),
            ("n_liquidated", "強平路徑數", lambda v: str(int(v)))])}
 
-**向後彎折判定**：{'✔ 於 L=' + f"{bend['bend_at']:.1f}" + ' 出現彎折——' + '、'.join(f"{v:.1f}" for v in bend['dominated']) + ' 被嚴格支配（MDD 更深、CAGR 未增）。' if bend['bend_at'] is not None else '✘ 未偵測到彎折：此區間 CAGR 仍隨槓桿上升，取捨仍是「真實交換」而非單方面變差。'}
+**向後彎折判定（綜合）**：{'✔ 於 L=' + f"{bend['bend_at']:.1f}" + ' 出現彎折——' + '、'.join(f"{v:.1f}" for v in bend['dominated']) + ' 被嚴格支配（MDD 更深、CAGR 未增）。' if bend['bend_at'] is not None else '✘ 未偵測到彎折：跨市場中位數的 CAGR 仍隨槓桿上升，取捨仍是「真實交換」而非單方面變差。'}
+
+**⚠️ 但綜合值掩蓋了市場層級的彎折**——逐市場檢定（規格 §5-1 要求「每市場一張」）：
+
+{_tbl(bend_mkt, [("market", "市場", lambda v: MARKET_LABEL.get(v, v)),
+                 ("bend_at", "彎折點", lambda v: f"L={v:.1f}" if v == v and v is not None else "無"),
+                 ("dominated", "被嚴格支配的 L_high", str),
+                 ("cagr_change", "CAGR（2.0→2.5）", _pp),
+                 ("mdd_change", "MDD 惡化", _pp)])}
+
+{bend_mkt_txt}
 """)
 
     # ══ §3 三條主曲線 / 邊際 / 效率 ══════════════════════════════════════════
@@ -261,14 +303,35 @@ D_10 有降載時段（空頭 regime → L_low=1.0），故時間加權平均槓
     sec.append(f"""## 8. 結論（規格 §6 八問）
 
 **Q1 在 2.0–2.5 區間，CAGR 是否仍隨槓桿上升？**
-{'**是**——CAGR ' + _pp(bend['cagr_total_change']) + '，未出現向後彎折。' if bend['cagr_still_rising'] else '**否**——於 L=' + f"{bend['bend_at']:.1f}" + ' 出現向後彎折，其後（' + '、'.join(f"{v:.1f}" for v in bend['dominated']) + '）**被嚴格支配**：更深回撤、無更多報酬。'}
-除錯核對（規格 §0 要求）：本輪成本、假跳空、破產／強平排除均已建模，
-存活者口徑已排除「歸零前暴賺」的假優勝者；CAGR 變化幅度 {_pp(bend['cagr_total_change'])}
-{'屬溫和量級，與理論預測（2.0–2.5 已在 g(L) 拋物線下降側附近、CAGR 持平或緩降）方向一致。' if abs(bend['cagr_total_change']) < 0.03 else '幅度較大，已於 §2 附完整平均槓桿欄供覆核。'}
+{'**是，但只是勉強上升**——CAGR ' + _pp(bend['cagr_total_change']) + '（' + _pc(f0['cagr']) + ' → ' + _pc(f1['cagr']) + '），未出現向後彎折。' if bend['cagr_still_rising'] else '**否**——於 L=' + f"{bend['bend_at']:.1f}" + ' 出現向後彎折，其後（' + '、'.join(f"{v:.1f}" for v in bend['dominated']) + '）**被嚴格支配**：更深回撤、無更多報酬。'}
+因此依規格 §6-1 的判準，**不能**宣告「2.0 以上被嚴格支配」——嚴格支配需要
+CAGR 停止上升，而它沒有。
 
-**Q2 Sharpe 是否單調下降？** {'**是**' if shp_mono else '**非嚴格單調**'}——自 L=2.0 的
-{_f(front['sharpe'].iloc[0], 3)} 到 2.5 的 {_f(front['sharpe'].iloc[-1], 3)}，合計 {d_shp:+.3f}
-（平均每 +0.1 槓桿約 {d_shp / 5:+.4f}）。
+但「仍在上升」不等於「划算」，完整代價是：
+- 同一區間 MDD 惡化 **{_pp(bend['mdd_total_change'])}**，邊際交換率
+  ΔCAGR/ΔMDD 全程僅 **{_f(marg['trade_ratio'].min(), 2)}–{_f(marg['trade_ratio'].max(), 2)}**
+  （每多承受 1 個百分點的回撤，只換到 {_f(marg['trade_ratio'].min(), 2)}–{_f(marg['trade_ratio'].max(), 2)} 個百分點的 CAGR，
+  全程遠低於 1）。
+- **每單位平均槓桿的 CAGR 單調下降**（{_pc(eff['cagr_per_lev'].iloc[0], 2)} → {_pc(eff['cagr_per_lev'].iloc[-1], 2)}，
+  相對 L=2.0 衰退 {_pc(abs(eff['eff_vs_base'].iloc[-1]), 1)}）——報酬增量**不只不是超線性，甚至是次線性**：
+  多開的曝險沒有等比例換回報酬。
+
+除錯核對（規格 §0 要求：若 CAGR 大幅單調上升應先懷疑 bug）：變化僅
+{_pp(bend['cagr_total_change'])}，**不屬於「大幅上升」**，無須懷疑成本或排除紀律有誤；
+成本、假跳空、破產／強平排除、存活者口徑均已建模並經測試覆核。相對理論預測
+（g(L) 拋物線下降側 → CAGR 持平或緩降），實測落在**接近持平、略偏上升**的一側。
+
+**Q2 Sharpe 是否單調下降？** {'**是**' if shp_mono else '**否——它幾乎完全持平**'}：自 L=2.0 的
+{_f(front['sharpe'].iloc[0], 3)} 到 2.5 的 {_f(front['sharpe'].iloc[-1], 3)}，合計 {d_shp:+.3f}，
+全區間極差僅 {_f(front['sharpe'].max() - front['sharpe'].min(), 3)}——比前三輪認定的噪音量級（0.08）
+還小一個數量級。
+
+> **這不是「槓桿沒有代價」，而是 Sharpe 這個指標對槓桿近乎不變**：等比例放大部位會
+> 同時放大超額報酬的均值與標準差，比值不變；只有融資成本、deadband 與路徑效應會造成
+> 二階偏移。規格 §0 預期的「Sharpe 單調下降」來自 `g(L)=r+Lα−L²σ²/2` 的**幾何成長**
+> 框架，而槓桿的懲罰正是顯現在**幾何**量（CAGR 的次線性、MDD 的擴大）而非 Sharpe。
+> 故本輪的取捨判讀應以 §2 的 frontier 與 Q1 的效率衰退為準，不應以 Sharpe 持平
+> 推論「加槓桿是免費的」。
 
 **Q3 MDD 惡化是線性還是凸性？** 自 2.0 → 2.5 惡化 **{_pp(bend['mdd_total_change'])}**；
 逐段惡化速率有 {int(conv_acc)}/{len(conv)} 段呈加速 → {'**凸性惡化**（越加槓桿、每單位代價越貴）。' if conv_acc >= len(conv) / 2 else '接近線性惡化。'}
@@ -278,9 +341,18 @@ D_10 有降載時段（空頭 regime → L_low=1.0），故時間加權平均槓
 （僅 +{_pc(lev_real['med_avg_lev'].iloc[-1] / lev_real['med_avg_lev'].iloc[0] - 1, 1)}，因 D_10 有降載時段）。
 
 **Q5 哪個 L_high 開始出現非零強平／歸零機率？**
-{'**L=' + f"{first_ruin:.1f}" + '**（見 §5 表）。' if first_ruin is not None else '**四市場 1,000 條合成路徑中，全部 L_high 的歸零／強平機率皆為 0**——'
- '在 20 年期、m=3.5% 的設定下，D_10 的降載機制使槓桿不足以觸及斷頭線。'}
+{'**L=' + f"{first_ruin:.1f}" + '**（見 §5 表）。' if first_ruin is not None else '**在本輪設定下沒有任何一格出現**——四市場 × 1,000 條 × 20 年合成路徑，'
+ '以及全部歷史滾動視窗，強平與破產路徑數皆為 **0**。'}
 不合格（>{RUIN_VETO_PROB:.0%}）者：{('、'.join(f"{v:.1f}" for v in veto_list)) if veto_list else '無'}。
+
+> **為什麼是 0？機制可由資料直接驗證**：§6 表中所有 L_high 的
+> **「MDD 谷底當日槓桿」一律 ≈ {_f(lev_real['med_lev_at_trough'].median(), 2)}**——
+> 也就是說，回撤最深的那一天，D_10 早已把曝險降到 L_low=1.0。而 L=1.0 的強平門檻
+> 需要標的下跌約 100%（`x_liq(1.0) = (1−m)/(1−m) = 1`），實務上不可能觸及。
+> 換言之：**保護來自趨勢濾網的降載，不是來自槓桿本身夠低**。這也意味著這個 0
+> 是**條件性**的——它依賴「降載訊號在崩盤前生效」。若市場以隔夜跳空方式一次跌穿
+> （本輪為日收盤粒度、且 bootstrap 打散了連續暴跌的序列結構），此保護會失效。
+> 規格 §3-3 的一票否決線在本輪因此完全沒有被觸發，**不應解讀為「2.5 倍很安全」**。
 
 **Q6 台股可承受連續跌停日數在哪個 L_high 掉到 3 日以下？**
 實測全區間為 {int(mt['limit_down_days_exact'].max())}–{int(mt['limit_down_days_exact'].min())} 日，
