@@ -163,3 +163,66 @@ def test_settlement_of_returns_tx_settlement():
 def test_today_index_none_when_absent():
     ss = build_signal_series(_cdf())
     assert ss.today_index(TODAY) is None
+
+
+# ── 序列持倉月已結算下市（每月結算後的例行過渡）─────────────────────────────
+
+def test_expired_held_contract_single_clear_warning(monkeypatch):
+    """🔴 2026-08-20 實況：TX 202608 於 8/19 結算，FinMind 資料也只到 8/19，
+    連續序列的事後到期判定（last_seen < data_end）尚未把它判為到期 →
+    仍以為持有 202608 → 查價必然失敗。
+
+    應以「單一」明確訊息說明，而非兩則模糊警示；且預覽與雙源核對皆略過。
+    """
+    cdf = _cdf()
+    monkeypatch.setattr(series, "load_tx_contracts", lambda **kw: cdf)
+    calls = {"price": 0, "settle": 0}
+
+    def price_fn(m):
+        calls["price"] += 1
+        raise RuntimeError("contract not found")
+
+    def settle_fn(m):
+        calls["settle"] += 1
+        return 46000.0 * 1.05          # 若被拿去核對會產生假性不一致
+
+    ss = prepare_series(TODAY, prev_settlement_fn=settle_fn,
+                        today_price_fn=price_fn,
+                        contract_exists_fn=lambda m: False)
+
+    expired = [w for w in ss.warnings if "已結算下市" in w]
+    assert len(expired) == 1 and ss.held_contract in expired[0]
+    assert "自動恢復" in expired[0]
+    # 舊的兩則模糊訊息不應再出現
+    assert not [w for w in ss.warnings if "即時價" in w]
+    # 雙源核對必須略過（否則會用錯月份比對出假警報）
+    # 註：比對「雙源核對：」帶冒號的實際告警格式——新訊息本身也含「雙源核對」四字
+    assert not [w for w in ss.warnings if "雙源核對：" in w]
+    assert calls["price"] == 0, "不應再對已下市合約查價"
+    assert not ss.has_provisional
+
+
+def test_tradable_held_contract_keeps_normal_behaviour(monkeypatch):
+    """合約仍可交易時行為不變（預覽正常追加、雙源核對照做）。"""
+    cdf = _cdf()
+    monkeypatch.setattr(series, "load_tx_contracts", lambda **kw: cdf)
+    ss = prepare_series(TODAY, prev_settlement_fn=lambda m: 46000.0,
+                        today_price_fn=lambda m: 46100.0,
+                        contract_exists_fn=lambda m: True)
+    assert ss.has_provisional
+    assert not [w for w in ss.warnings if "已結算下市" in w]
+
+
+def test_contract_exists_check_failure_falls_back_to_normal(monkeypatch):
+    """判定函式自身出錯 → 保守視為可交易，走原流程（不得因此中斷）。"""
+    cdf = _cdf()
+    monkeypatch.setattr(series, "load_tx_contracts", lambda **kw: cdf)
+
+    def boom(m):
+        raise RuntimeError("broker down")
+
+    ss = prepare_series(TODAY, prev_settlement_fn=lambda m: 46000.0,
+                        today_price_fn=lambda m: 46100.0,
+                        contract_exists_fn=boom)
+    assert ss.has_provisional
+    assert not [w for w in ss.warnings if "已結算下市" in w]

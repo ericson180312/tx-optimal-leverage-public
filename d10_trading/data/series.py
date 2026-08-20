@@ -142,7 +142,8 @@ def prepare_series(today: dt.date, *,
                    fetch_kwargs: dict | None = None,
                    prev_settlement_fn=None,
                    today_price_fn=None,
-                   ref_trustworthy: bool = True) -> SignalSeries:
+                   ref_trustworthy: bool = True,
+                   contract_exists_fn=None) -> SignalSeries:
     """日常批次的序列準備（重建 → 新鮮度 → 暫定列）。
 
     prev_settlement_fn(contract_yyyymm) -> float | None
@@ -154,11 +155,30 @@ def prepare_series(today: dt.date, *,
         13:20 執行恆為 True；遞補仍會用 reference（僅在執行時窗內具下單後果、彼時正確）。
     today_price_fn(contract_yyyymm) -> float | None
         今日即時價（暫定列）。None → 不加暫定列（預覽略過，不影響下單）。
+    contract_exists_fn(contract_yyyymm) -> bool
+        該月份合約是否仍可交易。**每月結算後的 1–2 個交易日**，序列的持倉月
+        已下市但 FinMind 資料尚未推進（到期判定為事後：`last_seen < data_end`），
+        此時對它查價／查參考價必然失敗。偵測到即以單一明確訊息說明，並略過
+        預覽與雙源核對——刻意不改查次月：次月與近月有月差（可達 0.3%），
+        代入會使雙源核對假性不一致，並在預覽 spot 插入假跳空而扭曲訊號。
     """
     cdf = load_tx_contracts(**(fetch_kwargs or {"force_current_year": True,
                                                 "today": today}))
     ss = build_signal_series(cdf)
     prev_td = calendar.prev_trading_day(today)
+
+    # ── 序列持倉月是否仍可交易（結算後的例行過渡，見 contract_exists_fn）──
+    held_tradable = True
+    if contract_exists_fn is not None:
+        try:
+            held_tradable = bool(contract_exists_fn(ss.held_contract))
+        except Exception:  # noqa: BLE001 - 判定失敗時保守視為可交易，走原流程
+            held_tradable = True
+    if not held_tradable:
+        ss.warnings.append(
+            f"序列持倉合約 {ss.held_contract} 已結算下市，FinMind 資料尚未推進"
+            "——今日略過訊號預覽與雙源核對，待資料推進後自動恢復"
+            "（每月結算後出現一次，不影響今日執行）")
 
     # ── 行事曆 vs 實際行情日互驗（近 90 天）───────────────────────────────
     problems = calendar.validate_against_actual(
@@ -174,7 +194,9 @@ def prepare_series(today: dt.date, *,
         px = prev_settlement_fn(ss.held_contract) if prev_settlement_fn else None
         if px is None or px <= 0:
             raise DataStaleError(
-                f"FinMind 與 Shioaji 皆無 {prev_td} 結算資料——停止，絕不用舊資料下單")
+                f"FinMind 與 Shioaji 皆無 {prev_td} 結算資料"
+                + ("；且序列持倉合約已下市、取不到參考價" if not held_tradable else "")
+                + "——停止，絕不用舊資料下單")
         append_official_fallback(ss, prev_td, float(px), "Shioaji 參考價")
     elif ss.last_official_date > today:
         raise DataStaleError(
@@ -182,7 +204,7 @@ def prepare_series(today: dt.date, *,
 
     # ── 雙源核對：上一交易日 FinMind 結算價 vs Shioaji 參考價（同為結算價）──
     # 僅在 reference 確為前日結算時比對（日盤收盤後 reference 已滾動 → 跳過）。
-    if ref_trustworthy and prev_settlement_fn is not None \
+    if held_tradable and ref_trustworthy and prev_settlement_fn is not None \
             and ss.last_official_date == prev_td:
         sj_px = prev_settlement_fn(ss.held_contract)
         if sj_px and sj_px > 0:
@@ -193,7 +215,8 @@ def prepare_series(today: dt.date, *,
                     f"Shioaji 參考價 {sj_px:.0f}，差 {diff:.3%} > {config.DUAL_SOURCE_TOL:.1%}")
 
     # ── 今日暫定列（預覽用；序列已含今日官方列則略過）──────────────────────
-    if ss.last_official_date < today and today_price_fn is not None:
+    want_preview = held_tradable and ss.last_official_date < today
+    if want_preview and today_price_fn is not None:
         try:
             px = today_price_fn(ss.held_contract)
         except Exception as e:  # noqa: BLE001 - 預覽失敗不影響今日執行（T+1）

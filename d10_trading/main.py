@@ -161,6 +161,7 @@ def _run_core(broker: BrokerInterface, st, today, now, dry_run, ignore_window,
                 today_price_fn=lambda m: broker.quote(
                     broker.contract_by_month(config.SIGNAL_PRODUCT, m).code).price,
                 ref_trustworthy=ref_ok,
+                contract_exists_fn=lambda m: _tx_contract_exists(broker, m),
             )
         except DataStaleError as e:
             if fuse_mode:
@@ -389,6 +390,21 @@ def _check_expiries(today: dt.date, warnings: list[str]) -> None:
             notify.send(item.level, msg)
         else:
             log.info("到期提醒（未推播）：%s", msg)
+
+
+def _tx_contract_exists(broker: BrokerInterface, month: str) -> bool:
+    """訊號商品（TX）該月份合約是否仍可交易。
+
+    每月結算後 1–2 個交易日，序列的持倉月已下市但 FinMind 資料尚未推進
+    （連續序列的到期判定是事後的：last_seen < data_end），此時查價必然失敗。
+    交給 series 層據此以單一明確訊息說明並略過預覽／雙源核對。
+    """
+    from d10_trading.execution.broker import BrokerError
+    try:
+        broker.contract_by_month(config.SIGNAL_PRODUCT, month)
+        return True
+    except BrokerError:
+        return False
 
 
 def _check_risk_indicator(broker: BrokerInterface, warnings: list[str]) -> None:
