@@ -278,3 +278,45 @@ def test_exec_vs_close_skips_roll_records(monkeypatch):
     main_mod._flush_exec_audit(st, ss)
     assert st.pending_exec_audit == []
     assert not (config.LOG_DIR / "exec_vs_close.csv").exists()
+
+
+# ── 盤外執行不得佔用當日冪等名額 ─────────────────────────────────────────────
+
+def _at(monkeypatch, hhmm: str):
+    """把 _now() 固定在今天的指定時刻（台北時區）。"""
+    import datetime as _dt
+    from zoneinfo import ZoneInfo
+    h, m = (int(x) for x in hhmm.split(":"))
+    fixed = _dt.datetime.combine(TODAY, _dt.time(h, m),
+                                 tzinfo=ZoneInfo(config.TIMEZONE))
+    monkeypatch.setattr(main_mod, "_now", lambda: fixed)
+
+
+def test_out_of_window_run_does_not_consume_the_day(monkeypatch):
+    """🔴 2026-09-01 實際踩到：凌晨手動觸發（無動作日）曾標記 executed_date，
+    導致 13:20 正式排程被冪等跳過——盤外價格的『無動作』結論不能代表 13:20。"""
+    broker = setup_scenario(monkeypatch)
+    _at(monkeypatch, "02:15")
+    assert run_daily(broker, today=TODAY) == 0        # 不傳 ignore_window
+    st = state_mod.load()
+    assert st.executed_date is None, "盤外執行不得標記本日已執行"
+
+    # 13:20 正式排程仍會完整執行並標記
+    _at(monkeypatch, "13:20")
+    assert run_daily(broker, today=TODAY) == 0
+    assert state_mod.load().executed_date == TODAY.isoformat()
+
+
+def test_in_window_run_commits_the_day(monkeypatch):
+    broker = setup_scenario(monkeypatch)
+    _at(monkeypatch, "13:20")
+    assert run_daily(broker, today=TODAY) == 0
+    assert state_mod.load().executed_date == TODAY.isoformat()
+
+
+def test_ignore_window_still_commits(monkeypatch):
+    """--ignore-window 是明確的人為意圖 → 仍標記（避免重複下單）。"""
+    broker = setup_scenario(monkeypatch)
+    _at(monkeypatch, "02:15")
+    assert run_daily(broker, today=TODAY, ignore_window=True) == 0
+    assert state_mod.load().executed_date == TODAY.isoformat()

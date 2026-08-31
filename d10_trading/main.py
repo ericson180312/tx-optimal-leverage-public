@@ -312,7 +312,19 @@ def _run_core(broker: BrokerInterface, st, today, now, dry_run, ignore_window,
                                           qty=p.quantity, avg_price=p.avg_price)
                             for p in post]
             held_after = sum(p.qty for p in st.positions)
-            st.executed_date = today.isoformat()
+            # 🔴 只有在執行時間窗內（或明確 --ignore-window）才標記「本日已執行」。
+            # 盤外批次（開機補跑、手動 systemctl start）用的是非收盤時段價格，
+            # 其「無動作」結論不能代表 13:20 的結論——標記了會讓正式排程被冪等
+            # 跳過，錯過當日該有的加減碼（2026-09-01 實際踩到）。
+            if _in_exec_window(now) or ignore_window:
+                st.executed_date = today.isoformat()
+            else:
+                msg = (f"盤外執行（{now:%H:%M} 不在 {config.EXEC_WINDOW}）"
+                       "——不標記本日已執行，13:20 排程仍會正常運行")
+                log.info("%s", msg)
+                warnings.append(msg)
+                audit("out_of_window_run", time=f"{now:%H:%M}",
+                      committed=False)
         else:
             held_after = held_qty
 
