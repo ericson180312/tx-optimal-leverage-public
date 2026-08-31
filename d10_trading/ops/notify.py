@@ -10,6 +10,7 @@ Telegram 未設定時退化為純日誌並提示（G1 前可接受；G2 起 READ
 from __future__ import annotations
 
 import logging
+import os
 
 import requests
 
@@ -83,6 +84,22 @@ def heartbeat(exit_code: int) -> None:
                   "請至 healthchecks.io 確認後更新 .env 的 HEALTHCHECK_URL")
 
 
+class _JournalLevelFormatter(logging.Formatter):
+    """為 systemd journal 加上 `<N>` 優先級前綴（SyslogLevelPrefix，預設啟用）。
+
+    🔴 不加前綴時，Python 的 ERROR/WARNING 一律以 info(6) 進 journal，
+    `journalctl -p err` 查不到任何東西——維運查詢會得到假的「一切正常」
+    （2026-09-01 實測：全期 -p err 命中 0 行，但 7/21 登入失敗確實是 ERROR）。
+    僅在 systemd 下（JOURNAL_STREAM 存在）加前綴，互動式終端輸出不受影響；
+    檔案日誌 sh 之外另有 handler，不套用本 formatter。
+    """
+    _MAP = {logging.CRITICAL: 2, logging.ERROR: 3, logging.WARNING: 4,
+            logging.INFO: 6, logging.DEBUG: 7}
+
+    def format(self, record: logging.LogRecord) -> str:
+        return f"<{self._MAP.get(record.levelno, 6)}>" + super().format(record)
+
+
 def setup_logging() -> None:
     """檔案（月輪替）+ 主控台雙路日誌。"""
     config.LOG_DIR.mkdir(parents=True, exist_ok=True)
@@ -96,6 +113,8 @@ def setup_logging() -> None:
         config.LOG_DIR / f"live_{dt.date.today():%Y%m}.log", encoding="utf-8")
     fh.setFormatter(fmt)
     sh = logging.StreamHandler()
-    sh.setFormatter(fmt)
+    # systemd 下加優先級前綴，讓 journalctl -p err/-p warning 真的有效
+    sh.setFormatter(_JournalLevelFormatter(fmt._fmt)
+                    if os.environ.get("JOURNAL_STREAM") else fmt)
     root.addHandler(fh)
     root.addHandler(sh)

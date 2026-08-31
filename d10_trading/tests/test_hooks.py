@@ -199,3 +199,42 @@ def test_risk_thresholds_keep_margin_below_normal_range():
         f"WARNING={config.RISK_INDICATOR_WARN}% 距常態最低 {normal_min:.0f}% 太近，會誤報")
     assert (config.RISK_INDICATOR_CRITICAL < config.RISK_INDICATOR_ALERT
             < config.RISK_INDICATOR_WARN), "門檻順序錯誤"
+
+
+# ── systemd journal 優先級前綴 ───────────────────────────────────────────────
+
+def test_journal_formatter_maps_levels():
+    """🔴 ERROR/WARNING 需帶 <3>/<4> 前綴，否則 journalctl -p err 查不到
+    （2026-09-01 實測：全期 -p err 命中 0 行，卻確實有 ERROR）。"""
+    import logging
+    f = notify._JournalLevelFormatter("%(message)s")
+    cases = [(logging.CRITICAL, "<2>"), (logging.ERROR, "<3>"),
+             (logging.WARNING, "<4>"), (logging.INFO, "<6>")]
+    for lvl, want in cases:
+        rec = logging.LogRecord("t", lvl, __file__, 1, "訊息", None, None)
+        assert f.format(rec).startswith(want), f"level {lvl} 應為 {want}"
+
+
+def test_setup_logging_uses_prefix_only_under_systemd(monkeypatch):
+    """互動式終端不加前綴（避免主控台出現 <6>）；systemd 下才加。"""
+    import logging
+
+    def _stream_fmt(env):
+        monkeypatch.setenv("JOURNAL_STREAM", env) if env else \
+            monkeypatch.delenv("JOURNAL_STREAM", raising=False)
+        root = logging.getLogger()
+        saved = root.handlers[:]
+        root.handlers = []
+        try:
+            notify.setup_logging()
+            sh = [h for h in root.handlers
+                  if isinstance(h, logging.StreamHandler)
+                  and not isinstance(h, logging.FileHandler)][0]
+            return sh.formatter
+        finally:
+            for h in root.handlers:
+                h.close()
+            root.handlers = saved
+
+    assert isinstance(_stream_fmt("9:12345"), notify._JournalLevelFormatter)
+    assert not isinstance(_stream_fmt(None), notify._JournalLevelFormatter)
