@@ -238,3 +238,41 @@ def test_setup_logging_uses_prefix_only_under_systemd(monkeypatch):
 
     assert isinstance(_stream_fmt("9:12345"), notify._JournalLevelFormatter)
     assert not isinstance(_stream_fmt(None), notify._JournalLevelFormatter)
+
+
+# ── 容量餘裕預警 ─────────────────────────────────────────────────────────────
+
+def test_capacity_warning_levels(monkeypatch):
+    """餘裕 ≥20% 靜默；<20% WARNING（僅週一推）；<5% ALERT（每日推）。"""
+    import datetime as dt
+    P = 47_303.0
+    e_bind, _ = main_mod.sizing.capacity_headroom(0.0, P)
+    MON, TUE = dt.date(2026, 9, 7), dt.date(2026, 9, 8)
+    cases = [
+        (e_bind * 0.50, MON, None),        # 餘裕 50% → 靜默
+        (e_bind * 0.78, MON, None),        # 餘裕 22%（門檻外）→ 靜默
+        # 註：不取「恰好 20%」——1−0.8 的浮點結果為 0.19999…，會落在門檻內側。
+        # 這是緩慢移動的諮詢性門檻，不需要精確到浮點邊界。
+        (e_bind * 0.85, MON, "WARNING"),   # 餘裕 15%，週一 → 推播
+        (e_bind * 0.98, TUE, "ALERT"),     # 餘裕 2% → 每日推播
+    ]
+    for eq, day, expect in cases:
+        sent = _capture_sends(monkeypatch)
+        warnings: list[str] = []
+        main_mod._check_capacity(eq, P, day, warnings)
+        if expect is None:
+            assert sent == [] and warnings == [], f"權益 {eq:,.0f} 不應告警"
+        else:
+            assert sent and sent[0][0] == expect
+            assert "MAX_CONTRACTS" in sent[0][1] and warnings
+
+
+def test_capacity_warning_not_pushed_midweek(monkeypatch):
+    """WARNING 等級在非週一只入摘要與稽核，不推播（防告警疲勞）。"""
+    import datetime as dt
+    P = 47_303.0
+    e_bind, _ = main_mod.sizing.capacity_headroom(0.0, P)
+    sent = _capture_sends(monkeypatch)
+    warnings: list[str] = []
+    main_mod._check_capacity(e_bind * 0.85, P, dt.date(2026, 9, 8), warnings)
+    assert sent == [] and warnings, "應入摘要但不推播"

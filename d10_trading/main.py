@@ -254,6 +254,7 @@ def _run_core(broker: BrokerInterface, st, today, now, dry_run, ignore_window,
             sizing.check_caps(sz.target_contracts, delta)
         except sizing.ContractsCapExceeded as e:
             raise DayStop(f"口數防呆：{e}") from e
+        _check_capacity(recon.equity, target_q_obj.price, today, warnings)
 
         log.info("訊號 %s（L_exec=%.1f，訊號日 %s）；權益 %.0f、目標 %d 口"
                  "（raw=%.2f、殘餘 %.2f）、現有 %d 口；月差 %.0f%s",
@@ -417,6 +418,33 @@ def _tx_contract_exists(broker: BrokerInterface, month: str) -> bool:
         return True
     except BrokerError:
         return False
+
+
+def _check_capacity(equity: float, price: float, today: dt.date,
+                    warnings: list[str]) -> None:
+    """MAX_CONTRACTS 容量餘裕預警——讓靜態上限的過期成為可預期。
+
+    上限是刻意靜態的防呆（見 config 註解），會隨權益成長而過期；不預警的話
+    會以「某天突然拒單停機」的方式讓人發現。餘裕 <20% 每週一提醒、<5% 每日提醒。
+    """
+    try:
+        e_bind, headroom = sizing.capacity_headroom(equity, price)
+    except Exception:  # noqa: BLE001 - 預警計算失敗不影響交易
+        return
+    if headroom >= config.CAPACITY_WARN_HEADROOM:
+        return
+    level = ("ALERT" if headroom < config.CAPACITY_ALERT_HEADROOM else "WARNING")
+    msg = (f"口數上限餘裕僅 {headroom:.0%}：權益 {equity:,.0f}，"
+           f"MAX_CONTRACTS={config.MAX_CONTRACTS} 對應權益上限約 {e_bind:,.0f}"
+           f"（以 L_HIGH={config.L_HIGH:g}、現價 {price:,.0f} 計）——"
+           "超過即目標口數大於上限而拒單停止，請及早調高 MAX_CONTRACTS")
+    warnings.append(msg)
+    audit("capacity_headroom", equity=round(equity), e_bind=round(e_bind),
+          headroom=round(headroom, 4), level=level)
+    if level == "ALERT" or today.weekday() == 0:      # WARNING 僅週一推播
+        notify.send(level, msg)
+    else:
+        log.info("容量預警（未推播）：%s", msg)
 
 
 def _check_risk_indicator(broker: BrokerInterface, warnings: list[str]) -> None:

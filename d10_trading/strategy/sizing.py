@@ -52,6 +52,23 @@ def check_caps(target: int, order_qty: int) -> None:
             f"下單口數 {abs(order_qty)} > MAX_CONTRACTS {config.MAX_CONTRACTS}")
 
 
+def capacity_headroom(equity: float, price: float, *,
+                      multiplier: float = config.MULTIPLIER,
+                      max_contracts: int = config.MAX_CONTRACTS,
+                      l_max: float = config.L_HIGH) -> tuple[float, float]:
+    """MAX_CONTRACTS 上限的權益容量與目前餘裕比例。
+
+    上限在 raw ≥ max_contracts + 0.5 時被觸及（half-up 捨入），故
+        E_bind = (max_contracts + 0.5) × price × multiplier ÷ l_max
+    以 **L_HIGH**（策略可能要求的最高槓桿）計算，而非當下的 l_exec——
+    BEAR 期間 L 較低會使餘裕看似寬鬆，但 regime 一翻轉上限就可能立即綁定。
+
+    回傳 (E_bind, headroom)；headroom = 1 − equity/E_bind，可為負（已超過）。
+    """
+    e_bind = (max_contracts + 0.5) * price * multiplier / l_max
+    return e_bind, 1.0 - equity / e_bind
+
+
 def current_leverage(contracts: int, price: float, equity: float,
                      *, multiplier: float = config.MULTIPLIER) -> float:
     """對帳後的現時槓桿（保險絲檢查用）。"""
