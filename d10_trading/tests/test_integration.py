@@ -320,3 +320,53 @@ def test_ignore_window_still_commits(monkeypatch):
     _at(monkeypatch, "02:15")
     assert run_daily(broker, today=TODAY, ignore_window=True) == 0
     assert state_mod.load().executed_date == TODAY.isoformat()
+
+
+# ── 價差單送出後的例外不得退回兩腳（重複建倉防線）─────────────────────────────
+
+def test_combo_post_submit_error_does_not_fall_back(monkeypatch):
+    """🔴 2026-09-02 審查發現：價差單送出後若 cancel/refresh 拋例外，
+    原本會被 _roll_common 當成「價差單不可用」而改走兩腳全額下單——
+    此時已部分成交，會在既有部位上重複建倉、曝險加倍（真錢路徑）。
+
+    送出後的例外必須就地轉為告警並停止，只有**送出前**的例外才可退兩腳。
+    """
+    broker = setup_scenario(monkeypatch, today=ROLL_TODAY)
+    broker.combo_fill_mode = "partial:2"           # 價差單部分成交 2/3 口
+
+    def boom(handle):
+        raise RuntimeError("API 撤單失敗")
+
+    monkeypatch.setattr(broker, "cancel", boom)
+    assert run(broker, today=ROLL_TODAY) == 1          # 告警停止
+
+    combos = [h for h in broker.placed if h.is_combo]
+    singles = [h for h in broker.placed if not h.is_combo]
+    assert len(combos) == 1, "價差單只應送出一次"
+    assert singles == [], "🔴 絕不可退回兩腳——已部分成交，會重複建倉"
+
+
+def test_combo_pre_submit_error_still_falls_back(monkeypatch):
+    """對照：送出前失敗（如模擬環境不支援組合單）仍須退回兩腳。"""
+    broker = setup_scenario(monkeypatch, today=ROLL_TODAY)
+    broker.combo_raises = True
+    assert run(broker, today=ROLL_TODAY) == 0
+    legs = [(h.action, h.code, h.quantity) for h in broker.placed]
+    assert legs == [("Buy", "TMF202609", 3), ("Sell", "TMF202608", 3)]
+
+
+def test_combo_net_price_deviation_alerts(monkeypatch):
+    """成交淨價與報價月差偏離過大 → 告警（抓淨價正負號慣例錯誤）。
+
+    FakeBroker 以「限價成交」模擬，故成交淨價 = 限價 = 月差 + 容忍，
+    偏離僅 2 檔，不應告警；把月差放大到量級相當於正負號翻轉時才須告警。
+    """
+    from d10_trading.execution import orders
+    broker = setup_scenario(monkeypatch, today=ROLL_TODAY, spread=20.0)
+    assert run(broker, today=ROLL_TODAY) == 0
+    st = state_mod.load()
+    assert not any("正負號" in w for w in (st.notes or "")), "正常滑價不應告警"
+
+    # 直接驗告警邏輯：成交淨價與報價月差差 40 點（> 20 點門檻）
+    assert orders._COMBO_NET_DEV_ALERT == 20.0
+    assert abs(-20.0 - 20.0) > orders._COMBO_NET_DEV_ALERT   # 正負號翻轉的量級

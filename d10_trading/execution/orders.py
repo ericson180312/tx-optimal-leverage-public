@@ -26,6 +26,10 @@ _TOL = config.PRICE_TOLERANCE_TICKS * _TICK
 
 TERMINAL = {"Filled", "Cancelled", "Failed"}
 
+# 價差單成交淨價與報價月差的容許偏離（點）。8/12 兩腳實測滑價 4.67 點，
+# 組合單應更小；20 點足以放行正常滑價，又能抓出正負號慣例錯誤（量級為 2×月差）。
+_COMBO_NET_DEV_ALERT = 20.0
+
 
 @dataclass
 class Fill:
@@ -179,20 +183,35 @@ def _roll_via_combo(broker: BrokerInterface, near_code: str, next_code: str,
     log.info("跨月價差單 Sell %s / Buy %s x%d 淨價限 %.0f",
              near_code, next_code, qty, net_limit)
     handle = broker.place_combo_roll(near_code, next_code, qty, net_limit)
-    st = _await_fill(broker, handle, config.ORDER_TIMEOUT_SECS, sleep_fn)
-    if st.status not in TERMINAL:               # 組合單不能改價 → 撤單重下一次
-        broker.cancel(handle)
-        st = broker.refresh(handle)
-        if st.deal_quantity == 0:
-            qn, qx = broker.quote(near_code), broker.quote(next_code)
-            net2 = ((qx.ask if qx.ask > 0 else qx.price)
-                    - (qn.bid if qn.bid > 0 else qn.price)) + 2 * _TOL
-            log.info("價差單逾時，重下淨價限 %.0f", net2)
-            handle = broker.place_combo_roll(near_code, next_code, qty, net2)
-            st = _await_fill(broker, handle, config.ORDER_TIMEOUT_SECS, sleep_fn)
-            if st.status not in TERMINAL:
-                broker.cancel(handle)
-                st = broker.refresh(handle)
+    # 🔴 委託已送出，市場曝險可能已經發生：此後**絕不可**讓例外往上拋。
+    # _roll_common 會把例外解讀成「價差單不可用」而改走兩腳全額下單；若此刻
+    # 已部分成交，就會在既有部位之上重複建倉、曝險加倍（2026-09-02 首次真實
+    # 價差單前的審查發現）。送出前的例外才屬於 fallback 的職責範圍。
+    try:
+        st = _await_fill(broker, handle, config.ORDER_TIMEOUT_SECS, sleep_fn)
+        if st.status not in TERMINAL:           # 組合單不能改價 → 撤單重下一次
+            broker.cancel(handle)
+            st = broker.refresh(handle)
+            if st.deal_quantity == 0:
+                qn, qx = broker.quote(near_code), broker.quote(next_code)
+                net2 = ((qx.ask if qx.ask > 0 else qx.price)
+                        - (qn.bid if qn.bid > 0 else qn.price)) + 2 * _TOL
+                log.info("價差單逾時，重下淨價限 %.0f", net2)
+                handle = broker.place_combo_roll(near_code, next_code, qty, net2)
+                st = _await_fill(broker, handle, config.ORDER_TIMEOUT_SECS,
+                                 sleep_fn)
+                if st.status not in TERMINAL:
+                    broker.cancel(handle)
+                    st = broker.refresh(handle)
+    except Exception as e:  # noqa: BLE001 - 見上：送出後一律就地處理，不得外拋
+        log.exception("價差單送出後的查詢/撤單失敗")
+        audit("combo_post_submit_error", code=f"{near_code}->{next_code}",
+              error=f"{type(e).__name__}: {e}")
+        rep.alerts.append(
+            f"🔴 價差單已送出但後續查詢/撤單失敗（{type(e).__name__}）——"
+            f"{near_code}→{next_code} 成交狀態不明，本日不再下任何單。"
+            "請至券商 App 確認實際部位，必要時以 --adopt-state 校正")
+        return rep                              # ok=False → 上層不做後續調整
     filled = st.deal_quantity
     audit("order_final", code=f"{near_code}->{next_code}", action="Roll",
           status=st.status, filled=filled, requested=qty,
@@ -204,6 +223,15 @@ def _roll_via_combo(broker: BrokerInterface, near_code: str, next_code: str,
                               note="combo"))
     if filled < qty:
         rep.alerts.append(f"轉倉價差單未足額：{filled}/{qty} 口")
+    # 🔴 成交淨價健全性：本模組假設 Shioaji 的組合單淨價 = legs 順序的
+    # 「Buy 次月 − Sell 近月」（見 broker.place_combo_roll）。此慣例從未經
+    # 真實環境驗證；若正負號或基準與假設不符，限價保護會失效而無聲成交。
+    # 故比對成交淨價與下單當時的報價月差，偏離過大即告警（不阻擋，已成交）。
+    if filled > 0 and abs(st.avg_fill_price - net) > _COMBO_NET_DEV_ALERT:
+        rep.alerts.append(
+            f"⚠️ 價差單成交淨價 {st.avg_fill_price:.0f} 與報價月差 {net:.0f} "
+            f"相差 {st.avg_fill_price - net:+.0f} 點（限價 {net_limit:.0f}）——"
+            "請確認券商的淨價正負號慣例與滑價是否合理")
     rep.ok = filled == qty
     return rep
 
