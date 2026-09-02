@@ -23,8 +23,21 @@ def test_audit_writes_jsonl_with_required_fields():
     assert len(evs) == 1
     e = evs[0]
     assert e["event"] == "unit_test_event" and e["foo"] == 1 and e["bar"] == "中文"
-    assert e["mode"] == "sim"                  # LIVE_TRADING=False
+    # 鎖定「對應關係」而非固定值——寫死 "sim" 會在 G2′ 切換閘門時假失敗
+    assert e["mode"] == ("live" if config.LIVE_TRADING else "sim")
     assert "T" in e["ts"]                      # ISO 時間戳
+
+
+def test_audit_mode_reflects_live_trading(monkeypatch):
+    """🔴 mode 欄位須忠實反映 LIVE_TRADING——稽核軌跡是事後分辨真單/模擬單的
+    唯一依據，兩種模式都必須正確標記（不依賴當前閘門設定）。"""
+    monkeypatch.setattr(config, "LIVE_TRADING", False)
+    audit("mode_probe_sim")
+    monkeypatch.setattr(config, "LIVE_TRADING", True)
+    audit("mode_probe_live")
+    modes = {e["event"]: e["mode"] for e in _events()}
+    assert modes["mode_probe_sim"] == "sim"
+    assert modes["mode_probe_live"] == "live"
 
 
 def test_notify_is_audited():

@@ -98,7 +98,7 @@ ROLL_LEAD_DAYS = 5           # 月差 > 0 → 結算日前 5 交易日轉倉；�
 ROLL_USE_COMBO = True        # 優先用 TAIFEX 跨月價差單；失敗退回兩腳分開下
 
 # ── 上線閘門（§9）🔴 ────────────────────────────────────────────────────────
-LIVE_TRADING = False         # G2 之前絕不改 True；True = 真實資金下單
+LIVE_TRADING = True          # 🔴 2026-09-02 G2′ 接管：真實資金下單（G1 於 09-01 由使用者宣告通過）
 SIMULATION = not LIVE_TRADING
 
 # 模擬環境的 margin() 回傳 0（Shioaji 模擬伺服器不提供權益數）。
