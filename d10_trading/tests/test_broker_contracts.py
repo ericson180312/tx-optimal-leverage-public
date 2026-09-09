@@ -101,3 +101,78 @@ def test_no_contracts_raises(monkeypatch):
     b = _broker({}, groups={})
     with pytest.raises(BrokerError):
         b.monthly_contracts("TMF")
+
+# ── 成交明細解析：組合單 vs 單腳的兩種 deals 口徑 ───────────────────────────
+
+def _deal(px, q):
+    from types import SimpleNamespace
+    return SimpleNamespace(price=px, quantity=q)
+
+
+def _stub_broker_with(trade):
+    """只裝出 refresh() 需要的最小 _api。"""
+    from types import SimpleNamespace
+    from d10_trading.execution.broker import ShioajiBroker
+    b = ShioajiBroker.__new__(ShioajiBroker)
+    b.simulation = False
+    b._api = SimpleNamespace(
+        futopt_account=object(),
+        update_combostatus=lambda acct: None,
+        list_combotrades=lambda: [trade],
+        update_status=lambda trade=None: None)
+    return b
+
+
+def test_refresh_parses_combo_deals_dict():
+    """🔴 組合單的 deals 是 {合約代碼: [Deal]} 的 dict——2026-09-09 首次真實
+    跨月價差單實測。原本一律當 list 迭代，迭代到的是 dict 的 key 字串，
+    取不到 price → 成交均價回報 0：成交價在 trades.jsonl 與稽核中全部遺失，
+    淨價健全性檢查也必然誤報（該次即誤報「相差 −195 點」）。
+    """
+    from types import SimpleNamespace as NS
+    from d10_trading.execution.broker import OrderHandle
+    status = NS(status=NS(value="Filled"), deal_quantity=3, msg="",
+                deals={"TMFI6": [_deal(47164, 3)], "TMFJ6": [_deal(47356, 3)]})
+    trade = NS(status=status)
+    h = OrderHandle(code="TMFI6->TMFJ6", action="Roll", quantity=3,
+                    price=197.0, raw=trade, is_combo=True)
+    snap = _stub_broker_with(trade).refresh(h)
+    assert snap.deal_quantity == 3
+    # 淨價 = 買腳 − 賣腳，與 place_combo_roll 的下單口徑一致（實測 192）
+    assert snap.avg_fill_price == 192.0
+    assert snap.leg_prices == {"TMFI6": 47164.0, "TMFJ6": 47356.0}
+
+
+def test_refresh_parses_single_leg_deals_list():
+    """單腳仍是 [Deal] 的 list，且為數量加權均價。"""
+    from types import SimpleNamespace as NS
+    from d10_trading.execution.broker import OrderHandle
+    status = NS(status=NS(value="Filled"), deal_quantity=3, msg="",
+                deals=[_deal(46000, 1), _deal(46030, 2)])
+    trade = NS(status=status)
+    h = OrderHandle(code="TMFI6", action="Buy", quantity=3, price=46030.0,
+                    raw=trade)
+    snap = _stub_broker_with(trade).refresh(h)
+    assert snap.avg_fill_price == (46000 * 1 + 46030 * 2) / 3
+    assert snap.leg_prices == {}
+
+
+def test_refresh_combo_missing_one_leg_yields_zero_net():
+    """只有單腳回報時淨價無意義 → 回 0（由上層的健全性檢查告警）。"""
+    from types import SimpleNamespace as NS
+    from d10_trading.execution.broker import OrderHandle
+    status = NS(status=NS(value="PartFilled"), deal_quantity=3, msg="",
+                deals={"TMFI6": [_deal(47164, 3)]})
+    trade = NS(status=status)
+    h = OrderHandle(code="TMFI6->TMFJ6", action="Roll", quantity=3,
+                   price=197.0, raw=trade, is_combo=True)
+    snap = _stub_broker_with(trade).refresh(h)
+    assert snap.avg_fill_price == 0.0
+    assert snap.leg_prices == {"TMFI6": 47164.0}
+
+
+def test_avg_deal_price_weighted_and_empty():
+    from d10_trading.execution.broker import _avg_deal_price
+    assert _avg_deal_price([_deal(100, 2), _deal(110, 3)]) == (106.0, 5)
+    assert _avg_deal_price([]) == (0.0, 0)
+    assert _avg_deal_price([_deal(0, 5), _deal(100, 0)]) == (0.0, 0)   # 無效值略過
