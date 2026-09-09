@@ -67,7 +67,7 @@ d10_trading/
 | live_YYYYMM.log | 完整程式日誌（月檔） |
 | daily_summary.csv | 每日一行摘要（regime/權益/口數/動作/警示） |
 | trades.jsonl | 成交明細 |
-| exec_vs_close.csv | 執行價 vs 官方收盤價偏差（次日補寫，規格 §2） |
+| exec_vs_close.csv | 執行價 vs 官方結算價偏差（次日補寫，規格 §2）。**每筆成交腿一列，各配自己月份的結算價**——轉倉時近月腿配近月、次月腿配次月；組合單依分腳實價拆列（淨價與結算價不可比，故不入此表，保存於 trades.jsonl）。2026-09-09 修正前：月份一律寫目標合約（近月腿被拿去比次月結算，偏差含月差），且組合單整筆被跳過而完全無稽核 |
 | scheduler.log | 排程器輸出（run_daily.bat 導向） |
 
 稽核查詢範例（PowerShell）：
