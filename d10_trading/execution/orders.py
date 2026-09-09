@@ -215,12 +215,14 @@ def _roll_via_combo(broker: BrokerInterface, near_code: str, next_code: str,
     filled = st.deal_quantity
     audit("order_final", code=f"{near_code}->{next_code}", action="Roll",
           status=st.status, filled=filled, requested=qty,
-          avg_price=st.avg_fill_price, order_price=handle.price)
+          avg_price=st.avg_fill_price, order_price=handle.price,
+          quoted_net=net, leg_prices=st.leg_prices)
     if filled > 0:
+        legs = "+".join(f"{c}@{px:.0f}" for c, px in sorted(st.leg_prices.items()))
         rep.fills.append(Fill(code=f"{near_code}->{next_code}", action="Roll",
                               quantity=filled, requested=qty,
                               price=st.avg_fill_price, order_price=handle.price,
-                              note="combo"))
+                              note=f"combo {legs}".strip()))
     if filled < qty:
         rep.alerts.append(f"轉倉價差單未足額：{filled}/{qty} 口")
     # 🔴 成交淨價健全性：本模組假設 Shioaji 的組合單淨價 = legs 順序的
