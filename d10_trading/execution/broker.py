@@ -57,9 +57,12 @@ class PositionInfo:
 class OrderStatusSnapshot:
     status: str               # PendingSubmit/Submitted/Filled/PartFilled/Cancelled/Failed
     deal_quantity: int = 0
-    avg_fill_price: float = 0.0
+    avg_fill_price: float = 0.0    # 單腳=成交均價；組合單=淨價（買腳 − 賣腳）
     order_price: float = 0.0
     msg: str = ""
+    # 組合單的分腳成交均價 {合約代碼: 均價}；單腳為空。轉倉的稽核要能回答
+    # 「兩腳各自成交在哪」——淨價本身無法還原這件事。
+    leg_prices: dict[str, float] = field(default_factory=dict)
 
 
 @dataclass
@@ -133,6 +136,18 @@ class BrokerInterface:
         except BrokerError:
             return None
         return float(ref) if ref and ref > 0 else None
+
+
+def _avg_deal_price(deals) -> tuple[float, int]:
+    """成交明細的數量加權均價，回傳 (均價, 總口數)；無有效成交回 (0.0, 0)。"""
+    tot_px = tot_q = 0.0
+    for d in deals or []:
+        px = float(getattr(d, "price", 0.0) or 0.0)
+        q = int(getattr(d, "quantity", 0) or 0)
+        if px > 0 and q > 0:
+            tot_px += px * q
+            tot_q += q
+    return (tot_px / tot_q, int(tot_q)) if tot_q else (0.0, 0)
 
 
 def _retry(fn, what: str):
@@ -478,17 +493,28 @@ class ShioajiBroker(BrokerInterface):
             st = handle.raw.status
             deals = getattr(st, "deals", None) or []
             fill_qty = int(getattr(st, "deal_quantity", 0) or 0)
-            prices, qtys = [], []
-            for d in deals:
-                px = float(getattr(d, "price", 0.0) or 0.0)
-                q = int(getattr(d, "quantity", 0) or 0)
-                if px > 0 and q > 0:
-                    prices.append(px * q)
-                    qtys.append(q)
-            avg = (sum(prices) / sum(qtys)) if qtys else 0.0
+            # 🔴 兩種 deals 口徑（2026-09-09 首次真實價差單實測）：
+            #   單腳   → [Deal, ...]
+            #   組合單 → {合約代碼: [Deal, ...]}（每腳一組）
+            # 原本一律當 list 迭代，組合單迭代到的是 dict 的「key 字串」，
+            # getattr(str, "price") 取不到值 → 成交均價回報 0，成交價在
+            # trades.jsonl 與稽核中全部遺失，淨價健全性檢查也必然誤報。
+            legs: dict[str, float] = {}
+            if isinstance(deals, dict):
+                for code, ds in deals.items():
+                    px, _ = _avg_deal_price(ds)
+                    if px > 0:
+                        legs[str(code)] = px
+                # 淨價 = 買腳 − 賣腳，與 place_combo_roll 的下單口徑一致
+                sell_code, _, buy_code = str(handle.code).partition("->")
+                buy_px, sell_px = legs.get(buy_code, 0.0), legs.get(sell_code, 0.0)
+                avg = (buy_px - sell_px) if (buy_px and sell_px) else 0.0
+            else:
+                avg, _ = _avg_deal_price(deals)
             return OrderStatusSnapshot(
                 status=str(getattr(st.status, "value", st.status)),
                 deal_quantity=fill_qty, avg_fill_price=avg,
                 order_price=handle.price,
-                msg=str(getattr(st, "msg", "") or ""))
+                msg=str(getattr(st, "msg", "") or ""),
+                leg_prices=legs)
         return _retry(_do, "委託狀態查詢")
