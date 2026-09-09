@@ -370,3 +370,61 @@ def test_combo_net_price_deviation_alerts(monkeypatch):
     # 直接驗告警邏輯：成交淨價與報價月差差 40 點（> 20 點門檻）
     assert orders._COMBO_NET_DEV_ALERT == 20.0
     assert abs(-20.0 - 20.0) > orders._COMBO_NET_DEV_ALERT   # 正負號翻轉的量級
+
+
+# ── 轉倉的執行品質稽核：逐腿月份 + 組合單拆腳 ─────────────────────────────────
+
+def test_combo_roll_yields_per_leg_exec_audit(monkeypatch):
+    """🔴 組合單轉倉須產生「每腿一筆」的待補稽核，且月份各自正確。
+
+    2026-09-09 首次真實價差單發現兩個缺陷：整筆的 code 含 "->" 會被補寫端
+    跳過（轉倉日零稽核，兩腳路徑卻有 2 列）；月份原本一律寫目標合約，
+    使近月腿被拿去與次月結算價比較。
+    """
+    broker = setup_scenario(monkeypatch, today=ROLL_TODAY, spread=20.0)
+    assert run(broker, today=ROLL_TODAY) == 0
+    st = state_mod.load()
+    recs = {r["code"]: r for r in st.pending_exec_audit}
+    assert set(recs) == {"TMF202608", "TMF202609"}, "應每腿一筆，且不含 '->' 整筆"
+    assert recs["TMF202608"]["month"] == "202608"      # 近月腿配近月結算
+    assert recs["TMF202609"]["month"] == "202609"      # 次月腿配次月結算
+    # 分腳價須為單腳實價（實價量級），不可是淨價（數十點量級）
+    near, nxt = recs["TMF202608"]["price"], recs["TMF202609"]["price"]
+    assert near > 40_000 and nxt > 40_000, "須為實價量級，不可是淨價"
+    assert nxt > near, "正價差情境：次月實價高於近月"
+
+
+def test_combo_roll_summary_exec_price_is_outright(monkeypatch):
+    """摘要 exec_price 與 official_close 同欄比較 → 須為新建腿實價，不可放淨價
+    （放淨價會讓 exec_vs_close_pct 算出約 −99% 的假偏差）。"""
+    broker = setup_scenario(monkeypatch, today=ROLL_TODAY, spread=20.0)
+    assert run(broker, today=ROLL_TODAY) == 0
+    import csv
+    row = [r for r in csv.DictReader(
+        open(config.LOG_DIR / "daily_summary.csv", encoding="utf-8-sig"))
+        if r["date"] == ROLL_TODAY.isoformat()][-1]
+    assert float(row["exec_price"]) > 40_000, "不可是淨價（數十點量級）"
+    # 兩個稽核面須互相一致：摘要的 exec_price = 待補紀錄裡新建腿（次月）的實價
+    nxt_rec = [r for r in state_mod.load().pending_exec_audit
+               if r["code"] == "TMF202609"][0]
+    assert float(row["exec_price"]) == nxt_rec["price"]
+
+
+def test_two_leg_roll_exec_audit_uses_each_leg_month(monkeypatch):
+    """兩腳路徑的既存偏差同樣修掉：近月腿不再配次月結算價。"""
+    broker = setup_scenario(monkeypatch, today=ROLL_TODAY)
+    broker.combo_raises = True                          # 逼走兩腳
+    assert run(broker, today=ROLL_TODAY) == 0
+    st = state_mod.load()
+    recs = {r["code"]: r["month"] for r in st.pending_exec_audit}
+    assert recs == {"TMF202609": "202609", "TMF202608": "202608"}
+
+
+def test_single_leg_rebalance_exec_audit_month(monkeypatch):
+    """非轉倉的單腳再平衡：月份取該合約自己的月份。"""
+    broker = setup_scenario(monkeypatch, price_fn=DROP_JULY)   # regime 切換 → 賣 1 口
+    assert run(broker) == 0
+    st = state_mod.load()
+    assert len(st.pending_exec_audit) == 1
+    r = st.pending_exec_audit[0]
+    assert r["month"] == _front_month(TODAY) and r["price"] > 30_000

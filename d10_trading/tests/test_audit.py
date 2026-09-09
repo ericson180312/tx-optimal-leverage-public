@@ -87,3 +87,43 @@ def test_audit_failure_never_raises(monkeypatch):
     (config.LOG_DIR.parent).mkdir(parents=True, exist_ok=True)
     (config.LOG_DIR).write_text("occupy")      # 讓 mkdir 失敗
     audit("should_not_raise")                  # 不拋出即通過
+
+
+# ── 待補稽核紀錄與摘要 exec_price 的口徑（單元）────────────────────────────────
+
+def test_summary_exec_price_picks_outright_leg():
+    """組合單取買腳實價、單腳取成交價、無成交回空字串。"""
+    import datetime as dt
+    from d10_trading import main as main_mod
+    from d10_trading.execution.orders import Fill
+    combo = Fill(code="TMFI6->TMFJ6", action="Roll", quantity=3, requested=3,
+                 price=192.0, order_price=197.0,
+                 legs={"TMFI6": 47164.0, "TMFJ6": 47356.0})
+    assert main_mod._summary_exec_price([combo]) == 47356.0     # 買腳（新建腿）
+    single = Fill(code="TMFI6", action="Buy", quantity=1, requested=1,
+                  price=47000.0, order_price=47002.0)
+    assert main_mod._summary_exec_price([single]) == 47000.0
+    assert main_mod._summary_exec_price([]) == ""
+    del dt
+
+
+def test_pending_exec_records_split_and_month():
+    import datetime as dt
+    from d10_trading import main as main_mod
+    from d10_trading.execution.orders import Fill
+    months = {"TMFI6": "202609", "TMFJ6": "202610"}
+    today = dt.date(2026, 9, 9)
+    combo = Fill(code="TMFI6->TMFJ6", action="Roll", quantity=3, requested=3,
+                 price=192.0, order_price=197.0,
+                 legs={"TMFI6": 47164.0, "TMFJ6": 47356.0})
+    recs = main_mod._pending_exec_records(today, combo, months.get)
+    assert recs == [
+        {"date": "2026-09-09", "code": "TMFI6", "month": "202609",
+         "price": 47164.0},
+        {"date": "2026-09-09", "code": "TMFJ6", "month": "202610",
+         "price": 47356.0}]
+    single = Fill(code="TMFJ6", action="Buy", quantity=1, requested=1,
+                  price=47356.0, order_price=47358.0)
+    assert main_mod._pending_exec_records(today, single, months.get) == [
+        {"date": "2026-09-09", "code": "TMFJ6", "month": "202610",
+         "price": 47356.0}]

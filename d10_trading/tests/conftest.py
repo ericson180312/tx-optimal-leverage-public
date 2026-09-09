@@ -151,6 +151,16 @@ class FakeBroker(BrokerInterface):
     def cancel(self, handle) -> None:
         handle.raw.cancelled = True
 
+    def combo_legs(self, handle: OrderHandle, net: float) -> dict[str, float]:
+        """組合單的分腳實價——真實 API 以 {合約: [Deal]} 回報，broker.refresh
+        將其還原為 leg_prices（2026-09-09 實測）。此處以近月報價為基準、
+        次月 = 近月 + 淨價，使淨價還原後恰為 net。"""
+        if not handle.is_combo:
+            return {}
+        sell_code, _, buy_code = handle.code.partition("->")
+        near = self.quotes[sell_code].price
+        return {sell_code: near, buy_code: near + net}
+
     def refresh(self, handle) -> OrderStatusSnapshot:
         fo: _FakeOrder = handle.raw
         if fo.final is not None:                   # 終態只入帳一次
@@ -159,7 +169,9 @@ class FakeBroker(BrokerInterface):
             status, qty, px = fo.fills_left.pop(0)
             if status == "Filled":
                 self._apply_fill(handle, qty, px)
-                fo.final = OrderStatusSnapshot("Filled", qty, px, handle.price)
+                fo.final = OrderStatusSnapshot(
+                    "Filled", qty, px, handle.price,
+                    leg_prices=self.combo_legs(handle, px))
                 return fo.final
             if status == "Failed":
                 fo.final = OrderStatusSnapshot("Failed", 0, 0.0, handle.price,
@@ -171,7 +183,9 @@ class FakeBroker(BrokerInterface):
         if fo.cancelled:                           # 撤單定案（部分成交入帳）
             if qty:
                 self._apply_fill(handle, qty, px)
-            fo.final = OrderStatusSnapshot("Cancelled", qty, px, handle.price)
+            fo.final = OrderStatusSnapshot(
+                "Cancelled", qty, px, handle.price,
+                leg_prices=self.combo_legs(handle, px) if qty else {})
             return fo.final
         return OrderStatusSnapshot("PartFilled" if qty else "Submitted",
                                    qty, px, handle.price)

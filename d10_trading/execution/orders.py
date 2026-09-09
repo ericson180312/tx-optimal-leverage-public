@@ -40,6 +40,9 @@ class Fill:
     price: float           # 成交均價（組合單為淨價）
     order_price: float
     note: str = ""
+    # 組合單的分腳成交實價 {合約代碼: 均價}；單腳為空。淨價無法還原兩腿各自
+    # 成交在哪，而 exec_vs_close 稽核需要**單腳實價**（淨價與結算價不可比）。
+    legs: dict[str, float] = field(default_factory=dict)
 
 
 @dataclass
@@ -218,11 +221,10 @@ def _roll_via_combo(broker: BrokerInterface, near_code: str, next_code: str,
           avg_price=st.avg_fill_price, order_price=handle.price,
           quoted_net=net, leg_prices=st.leg_prices)
     if filled > 0:
-        legs = "+".join(f"{c}@{px:.0f}" for c, px in sorted(st.leg_prices.items()))
         rep.fills.append(Fill(code=f"{near_code}->{next_code}", action="Roll",
                               quantity=filled, requested=qty,
                               price=st.avg_fill_price, order_price=handle.price,
-                              note=f"combo {legs}".strip()))
+                              note="combo", legs=dict(st.leg_prices)))
     if filled < qty:
         rep.alerts.append(f"轉倉價差單未足額：{filled}/{qty} 口")
     # 🔴 成交淨價健全性：本模組假設 Shioaji 的組合單淨價 = legs 順序的

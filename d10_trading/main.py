@@ -298,11 +298,14 @@ def _run_core(broker: BrokerInterface, st, today, now, dry_run, ignore_window,
                     notify.send("ALERT" if not rep.ok else "WARNING", a)
                 oplog.write_fills(today, rep.fills)
                 for f in rep.fills:
+                    legs_txt = ("（" + "、".join(
+                        f"{c}@{px:.0f}" for c, px in sorted(f.legs.items()))
+                        + "）") if f.legs else ""
                     notify.send("INFO", f"成交：{f.action} {f.code} "
-                                        f"{f.quantity}/{f.requested} 口 @ {f.price:.0f}")
-                    st.pending_exec_audit.append(
-                        {"date": today.isoformat(), "code": f.code,
-                         "month": target_c.delivery_month, "price": f.price})
+                                        f"{f.quantity}/{f.requested} 口 @ "
+                                        f"{f.price:.0f}{legs_txt}")
+                    st.pending_exec_audit.extend(
+                        _pending_exec_records(today, f, month_of_code))
 
         # ── 6. 讀回實際部位、落地狀態 ──────────────────────────────────────
         if not dry_run:
@@ -346,7 +349,7 @@ def _run_core(broker: BrokerInterface, st, today, now, dry_run, ignore_window,
             "price": target_q_obj.price, "target_contracts": sz.target_contracts,
             "held_before": held_qty, "held_after": held_after,
             "achieved_leverage": round(ach, 3), "action": action_desc,
-            "exec_price": rep.fills[0].price if rep.fills else "",
+            "exec_price": _summary_exec_price(rep.fills),
             "official_close": "", "exec_vs_close_pct": "",
             "preview_leverage": preview if preview is not None else "",
             "warnings": "；".join(warnings),
@@ -418,6 +421,43 @@ def _tx_contract_exists(broker: BrokerInterface, month: str) -> bool:
         return True
     except BrokerError:
         return False
+
+
+def _pending_exec_records(today: dt.date, fill, month_of_code) -> list[dict]:
+    """成交腿 → exec_vs_close 待補紀錄（每腿一筆，各帶**自己的**合約月份）。
+
+    🔴 兩處修正（2026-09-09 首次真實價差單後發現）：
+
+    1. 月份必須逐腿判定。原本一律寫 `target_c.delivery_month`，使近月腿被拿去
+       與**次月**結算價比較——8/12 的 `TMFH6 45,380 vs 結算 45,673 → −0.64%`
+       其中大半是月差本身，不是執行品質。這是兩腳路徑也有的既存偏差。
+    2. 組合單須依 legs 拆成分腳實價。否則整筆的 code 含 "->"，會被補寫端
+       （`_flush_exec_audit`）的防線跳過 → 轉倉日完全沒有執行品質稽核
+       （兩腳路徑 2 列、組合單 0 列）。當初「淨價無單一結算對照」的取捨成立，
+       是因為只有淨價可用；leg_prices 到手後該前提已不存在。
+    """
+    if fill.legs:
+        return [{"date": today.isoformat(), "code": code,
+                 "month": month_of_code(code), "price": px}
+                for code, px in sorted(fill.legs.items())]
+    return [{"date": today.isoformat(), "code": fill.code,
+             "month": month_of_code(fill.code), "price": fill.price}]
+
+
+def _summary_exec_price(fills):
+    """每日摘要的 exec_price：與 official_close 同欄比較，故須為**單腳實價**。
+
+    組合單取「新建腿」（買腳）的實價而非淨價——淨價與結算價不可比，
+    放淨價會讓 exec_vs_close_pct 算出約 −99% 的假偏差（2026-09-09 實測：
+    淨價 192 vs 結算 47,000 量級）。淨價本身仍完整保存於 trades.jsonl。
+    """
+    if not fills:
+        return ""
+    f = fills[0]
+    if f.legs:
+        _, _, buy_code = str(f.code).partition("->")
+        return f.legs.get(buy_code, f.price)
+    return f.price
 
 
 def _check_capacity(equity: float, price: float, today: dt.date,
