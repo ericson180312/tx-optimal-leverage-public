@@ -428,3 +428,66 @@ def test_single_leg_rebalance_exec_audit_month(monkeypatch):
     assert len(st.pending_exec_audit) == 1
     r = st.pending_exec_audit[0]
     assert r["month"] == _front_month(TODAY) and r["price"] > 30_000
+
+
+# ── 月差追蹤：逐日紀錄與轉倉月差滑價 ─────────────────────────────────────────
+
+def _roll_spread_rows():
+    import csv
+    path = config.LOG_DIR / "roll_spread.csv"
+    if not path.exists():
+        return []
+    return list(csv.DictReader(open(path, encoding="utf-8-sig")))
+
+
+def test_roll_spread_recorded_daily(monkeypatch):
+    """每個交易日都留一列月差，且 t_minus 為距結算的交易日數。"""
+    broker = setup_scenario(monkeypatch, spread=25.0)
+    assert run(broker) == 0
+    rows = _roll_spread_rows()
+    assert len(rows) == 1
+    r = rows[0]
+    assert r["date"] == TODAY.isoformat()
+    assert float(r["spread"]) == 25.0
+    assert r["rolled"] == "", "非轉倉日 rolled 應為空"
+    # t_minus：TODAY(7/16) 距 202607 結算日的交易日數，須為正且與行事曆一致
+    settle = dt.date.fromisoformat(r["settlement"])
+    assert int(r["t_minus"]) == calendar.trading_days_between(TODAY, settle)
+    assert int(r["t_minus"]) > 0
+    # spread_pct 供跨價位比較
+    assert float(r["spread_pct"]) == round(25.0 / float(r["near_price"]), 6)
+
+
+def test_roll_spread_marks_roll_day_and_t_minus_5(monkeypatch):
+    """T−5 提前轉倉日：t_minus 恰為 ROLL_LEAD_DAYS，rolled 記下 reason。"""
+    broker = setup_scenario(monkeypatch, today=ROLL_TODAY, spread=20.0)
+    assert run(broker, today=ROLL_TODAY) == 0
+    r = _roll_spread_rows()[-1]
+    assert r["rolled"] == "early_roll"
+    assert int(r["t_minus"]) == config.ROLL_LEAD_DAYS
+    assert r["near_month"] == "202608" and r["next_month"] == "202609"
+
+
+def test_roll_spread_not_written_on_dry_run(monkeypatch):
+    broker = setup_scenario(monkeypatch)
+    assert run_daily(broker, today=TODAY, ignore_window=True, dry_run=True) == 0
+    assert _roll_spread_rows() == []
+
+
+def test_roll_day_stages_slippage_context(monkeypatch):
+    """轉倉日把兩腿連同 roll/path 脈絡暫存；月差滑價於**次日**結算到位後才算
+    （批次的補寫在成交之前執行，當日結算價尚不存在——與 9/9→9/10 實況一致）。"""
+    broker = setup_scenario(monkeypatch, today=ROLL_TODAY, spread=20.0)
+    assert run(broker, today=ROLL_TODAY) == 0
+    recs = state_mod.load().pending_exec_audit
+    assert len(recs) == 2
+    assert all(r["roll"] == "early_roll" and r["path"] == "combo" for r in recs)
+    assert not (config.LOG_DIR / "roll_slippage.csv").exists(), "當日不應已算出"
+
+
+def test_plain_rebalance_stages_no_roll_context(monkeypatch):
+    """非轉倉的單腳再平衡：roll 標記為空 → 永不會被配對成月差滑價。"""
+    broker = setup_scenario(monkeypatch, price_fn=DROP_JULY)   # 減碼 1 口
+    assert run(broker) == 0
+    recs = state_mod.load().pending_exec_audit
+    assert len(recs) == 1 and recs[0]["roll"] == ""

@@ -85,6 +85,28 @@ def shift_trading_days(d: dt.date, n: int) -> dt.date:
     return cur
 
 
+def trading_days_between(start: dt.date, end: dt.date) -> int | None:
+    """由 start 需前進幾個交易日才到 end（同日 = 0，end 早於 start 為負）。
+
+    用於標記「距結算第幾個交易日」（T−n）：結算日當天 0、提前轉倉日 5。
+    任一端超出假日檔涵蓋年份或非交易日導致無法判定時回 None——這是追蹤用的
+    輔助資訊，不可讓它擋住交易流程。
+    """
+    try:
+        _require_coverage(start)
+        _require_coverage(end)
+    except CalendarCoverageError:
+        return None
+    sign = 1 if end >= start else -1
+    lo, hi = (start, end) if sign > 0 else (end, start)
+    n, d = 0, lo
+    while d < hi:
+        d += dt.timedelta(days=1)
+        if is_trading_day(d):
+            n += 1
+    return sign * n
+
+
 def third_wednesday(year: int, month: int) -> dt.date:
     first = dt.date(year, month, 1)
     offset = (2 - first.weekday()) % 7   # Wed == 2
