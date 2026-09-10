@@ -114,16 +114,76 @@ def test_pending_exec_records_split_and_month():
     months = {"TMFI6": "202609", "TMFJ6": "202610"}
     today = dt.date(2026, 9, 9)
     combo = Fill(code="TMFI6->TMFJ6", action="Roll", quantity=3, requested=3,
-                 price=192.0, order_price=197.0,
+                 price=192.0, order_price=197.0, note="combo",
                  legs={"TMFI6": 47164.0, "TMFJ6": 47356.0})
-    recs = main_mod._pending_exec_records(today, combo, months.get)
+    recs = main_mod._pending_exec_records(today, combo, months.get, "early_roll")
     assert recs == [
         {"date": "2026-09-09", "code": "TMFI6", "month": "202609",
-         "price": 47164.0},
+         "price": 47164.0, "roll": "early_roll", "path": "combo"},
         {"date": "2026-09-09", "code": "TMFJ6", "month": "202610",
-         "price": 47356.0}]
+         "price": 47356.0, "roll": "early_roll", "path": "combo"}]
+    # 非轉倉的單腳：roll 為空，故不會被 _flush_roll_slippage 配對
     single = Fill(code="TMFJ6", action="Buy", quantity=1, requested=1,
                   price=47356.0, order_price=47358.0)
     assert main_mod._pending_exec_records(today, single, months.get) == [
         {"date": "2026-09-09", "code": "TMFJ6", "month": "202610",
-         "price": 47356.0}]
+         "price": 47356.0, "roll": "", "path": ""}]
+
+
+def test_flush_roll_slippage_computes_spread_cost(tmp_path, monkeypatch):
+    """🔴 轉倉的成本口徑 = 執行月差 − 結算月差。
+
+    兩腿共同的時間滑價（13:20 執行 vs 13:45 結算）在轉倉中完全對消——一腿買、
+    一腿賣——故單看各腿的 exec_vs_close 偏差會高估成本。以 2026-09-09 實測值
+    驗證：兩腿偏差皆 −0.030%，但月差滑價為 0（價差單把月差鎖住了）。
+    """
+    import csv
+    from d10_trading import main as main_mod
+    resolved = [
+        ({"date": "2026-09-09", "code": "TMFI6", "month": "202609",
+          "price": 47164.0, "roll": "early_roll", "path": "combo"}, 47178.0),
+        ({"date": "2026-09-09", "code": "TMFJ6", "month": "202610",
+          "price": 47356.0, "roll": "early_roll", "path": "combo"}, 47370.0),
+    ]
+    main_mod._flush_roll_slippage(resolved)
+    rows = list(csv.DictReader(
+        open(config.LOG_DIR / "roll_slippage.csv", encoding="utf-8-sig")))
+    assert len(rows) == 1
+    r = rows[0]
+    assert float(r["exec_spread"]) == 192.0        # 47356 − 47164
+    assert float(r["settle_spread"]) == 192.0      # 47370 − 47178
+    assert float(r["slippage_points"]) == 0.0      # 價差單把月差鎖住
+    assert r["path"] == "combo" and r["near_code"] == "TMFI6"
+
+
+def test_flush_roll_slippage_matches_two_leg_cost():
+    """8/12 兩腳的實際數字：執行月差 164.67 − 結算月差 157 = +7.67 點。"""
+    import csv
+    from d10_trading import main as main_mod
+    resolved = [
+        ({"date": "2026-08-12", "code": "TMFH6", "month": "202608",
+          "price": 45380.333333, "roll": "early_roll", "path": "two_legs"}, 45516.0),
+        ({"date": "2026-08-12", "code": "TMFI6", "month": "202609",
+          "price": 45545.0, "roll": "early_roll", "path": "two_legs"}, 45673.0),
+    ]
+    main_mod._flush_roll_slippage(resolved)
+    r = list(csv.DictReader(
+        open(config.LOG_DIR / "roll_slippage.csv", encoding="utf-8-sig")))[-1]
+    assert float(r["slippage_points"]) == 7.67
+    assert r["path"] == "two_legs"
+
+
+def test_flush_roll_slippage_ignores_incomplete_or_non_roll():
+    """單腿、非轉倉、同月份 → 不產生任何列（寧缺勿誤）。"""
+    from d10_trading import main as main_mod
+    base = {"date": "2026-09-09", "month": "202609", "price": 47164.0,
+            "path": "combo"}
+    for resolved in (
+        [({**base, "code": "A", "roll": "early_roll"}, 47178.0)],          # 只一腿
+        [({**base, "code": "A", "roll": ""}, 47178.0),
+         ({**base, "code": "B", "roll": "", "month": "202610"}, 47370.0)],  # 非轉倉
+        [({**base, "code": "A", "roll": "early_roll"}, 47178.0),
+         ({**base, "code": "B", "roll": "early_roll"}, 47370.0)],           # 同月份
+    ):
+        main_mod._flush_roll_slippage(resolved)
+    assert not (config.LOG_DIR / "roll_slippage.csv").exists()

@@ -50,3 +50,19 @@ def test_validate_against_actual():
     missing = [d for d in days if d != dt.date(2026, 6, 10)]
     problems = calendar.validate_against_actual(missing, since)
     assert any("2026-06-10" in p for p in problems)
+
+
+def test_trading_days_between():
+    """距結算的交易日數：同日 0、往前為正、反向為負；跨週末不計假日。"""
+    from d10_trading import config as cfg
+    from d10_trading.data import calendar as cal
+    settle = dt.date(2026, 8, 19)                    # 2026-08 結算日（週三）
+    assert cal.trading_days_between(settle, settle) == 0
+    early = cal.shift_trading_days(settle, -cfg.ROLL_LEAD_DAYS)
+    assert cal.trading_days_between(early, settle) == cfg.ROLL_LEAD_DAYS
+    assert cal.trading_days_between(settle, early) == -cfg.ROLL_LEAD_DAYS
+    # 跨週末：週五 → 下週一 = 1 個交易日
+    fri, mon = dt.date(2026, 8, 14), dt.date(2026, 8, 17)
+    assert cal.trading_days_between(fri, mon) == 1
+    # 超出假日檔涵蓋 → None（不可拋，這是追蹤用的輔助資訊）
+    assert cal.trading_days_between(dt.date(1990, 1, 2), settle) is None
