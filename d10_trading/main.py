@@ -305,7 +305,9 @@ def _run_core(broker: BrokerInterface, st, today, now, dry_run, ignore_window,
                                         f"{f.quantity}/{f.requested} 口 @ "
                                         f"{f.price:.0f}{legs_txt}")
                     st.pending_exec_audit.extend(
-                        _pending_exec_records(today, f, month_of_code))
+                        _pending_exec_records(
+                            today, f, month_of_code,
+                            roll.reason if roll.should_roll else ""))
 
         # ── 6. 讀回實際部位、落地狀態 ──────────────────────────────────────
         if not dry_run:
@@ -356,6 +358,7 @@ def _run_core(broker: BrokerInterface, st, today, now, dry_run, ignore_window,
         }
         if not dry_run:
             oplog.write_summary(summary)
+            _write_roll_spread(today, front, nxt, q_front, q_next, roll)
         notify.send("INFO",
                     f"{today} 摘要｜{cur_regime} L={l_exec:g}｜權益 "
                     f"{recon.equity:,.0f}｜{held_qty}→{held_after} 口"
@@ -423,7 +426,27 @@ def _tx_contract_exists(broker: BrokerInterface, month: str) -> bool:
         return False
 
 
-def _pending_exec_records(today: dt.date, fill, month_of_code) -> list[dict]:
+def _write_roll_spread(today, front, nxt, q_front, q_next, roll) -> None:
+    """逐日寫出近月/次月月差（roll_spread.csv）。追蹤用，失敗不影響流程。"""
+    try:
+        px = float(q_front.price)
+        oplog.write_roll_spread({
+            "date": today.isoformat(),
+            "near_month": front.delivery_month,
+            "next_month": nxt.delivery_month,
+            "settlement": front.delivery_date.isoformat(),
+            "t_minus": calendar.trading_days_between(today, front.delivery_date),
+            "near_price": px, "next_price": float(q_next.price),
+            "spread": round(float(roll.spread), 2),
+            "spread_pct": round(float(roll.spread) / px, 6) if px else "",
+            "rolled": roll.reason if roll.should_roll else "",
+        })
+    except Exception:  # noqa: BLE001 - 追蹤紀錄絕不可影響交易
+        log.warning("roll_spread 紀錄寫入失敗（忽略）", exc_info=True)
+
+
+def _pending_exec_records(today: dt.date, fill, month_of_code,
+                          roll_reason: str = "") -> list[dict]:
     """成交腿 → exec_vs_close 待補紀錄（每腿一筆，各帶**自己的**合約月份）。
 
     🔴 兩處修正（2026-09-09 首次真實價差單後發現）：
@@ -436,12 +459,15 @@ def _pending_exec_records(today: dt.date, fill, month_of_code) -> list[dict]:
        （兩腳路徑 2 列、組合單 0 列）。當初「淨價無單一結算對照」的取捨成立，
        是因為只有淨價可用；leg_prices 到手後該前提已不存在。
     """
+    # roll/path 供 _flush_exec_audit 事後配對兩腿、算出月差滑價
+    ctx = {"roll": roll_reason,
+           "path": (fill.note or "").split()[0] if fill.note else ""}
     if fill.legs:
         return [{"date": today.isoformat(), "code": code,
-                 "month": month_of_code(code), "price": px}
+                 "month": month_of_code(code), "price": px, **ctx}
                 for code, px in sorted(fill.legs.items())]
     return [{"date": today.isoformat(), "code": fill.code,
-             "month": month_of_code(fill.code), "price": fill.price}]
+             "month": month_of_code(fill.code), "price": fill.price, **ctx}]
 
 
 def _summary_exec_price(fills):
@@ -565,21 +591,62 @@ def _flush_exec_audit(st, ss) -> None:
     與策略口徑一致，取代先前的日盤 K 棒收盤（那是收盤集合競價價、非結算）。
     結算價未到位（同日尚無 FinMind）→ 保留待下次批次補記。
     """
-    remain = []
+    remain, resolved = [], []
     for rec in st.pending_exec_audit:
         try:
             d = dt.date.fromisoformat(rec["date"])
             month = rec.get("month", "")
             if not month or "->" in rec.get("code", ""):
-                continue                       # 轉倉淨價無單一結算對照
+                continue                       # 無單一結算對照（舊格式整筆淨價）
             settle = ss.settlement_of(month, d)
             if settle:
                 oplog.append_exec_vs_close(d, rec["code"], rec["price"], settle)
+                resolved.append((rec, float(settle)))
             else:
                 remain.append(rec)             # 結算未到位 → 次日再補
         except Exception:  # noqa: BLE001 - 稽核補寫失敗不影響交易
             remain.append(rec)
     st.pending_exec_audit = remain
+    _flush_roll_slippage(resolved)
+
+
+def _flush_roll_slippage(resolved: list[tuple[dict, float]]) -> None:
+    """由已取得結算價的兩腿算出**月差滑價**（執行月差 − 結算月差）。
+
+    只在同一天恰有兩筆帶 roll 標記、且月份不同的紀錄時成立——那正是一次完整
+    轉倉的兩腿。任一腿的結算價尚未到位時整組留待次日（兩腿的結算來自同一天的
+    序列，通常同時到位）。近月 = 月份較小者。失敗不影響流程。
+    """
+    by_date: dict[str, list[tuple[dict, float]]] = {}
+    for rec, settle in resolved:
+        if rec.get("roll"):
+            by_date.setdefault(rec["date"], []).append((rec, settle))
+    for date, pair in by_date.items():
+        try:
+            if len(pair) != 2:
+                continue
+            pair.sort(key=lambda x: x[0]["month"])       # 近月在前
+            (near, s_near), (nxt, s_next) = pair
+            if near["month"] == nxt["month"]:
+                continue
+            exec_spread = float(nxt["price"]) - float(near["price"])
+            settle_spread = s_next - s_near
+            slip = exec_spread - settle_spread
+            oplog.append_roll_slippage({
+                "date": date, "near_code": near["code"], "next_code": nxt["code"],
+                "path": near.get("path", ""),
+                "exec_near": float(near["price"]), "exec_next": float(nxt["price"]),
+                "exec_spread": round(exec_spread, 2),
+                "settle_near": s_near, "settle_next": s_next,
+                "settle_spread": round(settle_spread, 2),
+                "slippage_points": round(slip, 2),
+                "slippage_pct": (round(slip / settle_spread, 6)
+                                 if settle_spread else ""),
+            })
+            log.info("轉倉月差滑價（%s，%s）：執行 %.2f − 結算 %.2f = %+.2f 點",
+                     date, near.get("path", "?"), exec_spread, settle_spread, slip)
+        except Exception:  # noqa: BLE001 - 追蹤紀錄絕不可影響交易
+            log.warning("roll_slippage 計算失敗（忽略）", exc_info=True)
 
 
 def main(argv=None) -> int:
