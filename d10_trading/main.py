@@ -287,7 +287,8 @@ def _run_core(broker: BrokerInterface, st, today, now, dry_run, ignore_window,
                 if roll.should_roll:
                     rep = orders.execute_roll(broker, front.code, nxt.code,
                                               held_qty, sz.target_contracts,
-                                              sleep_fn=sleep_fn)
+                                              sleep_fn=sleep_fn,
+                                              guard=_expiry_guard(today, front))
                 else:
                     act = "Buy" if delta > 0 else "Sell"
                     rep = orders.execute_limit(broker, target_c.code, act,
@@ -424,6 +425,24 @@ def _tx_contract_exists(broker: BrokerInterface, month: str) -> bool:
         return True
     except BrokerError:
         return False
+
+
+def _expiry_guard(today: dt.date, front) -> "orders.ExpiryGuard | None":
+    """近月**最後交易日**才建立轉倉時序護欄；其他日回 None（行為完全不變）。
+
+    🔴 以日期判定，不用 `roll.reason == "expiry_roll"`——`late_roll`（月差在 T−5
+    之後才轉正）也可能在該日觸發，面對同一個 13:30 死線。用日期同時涵蓋兩者。
+
+    護欄反映的是**交易所事實**（到期月份契約該日 13:30 停止交易），故
+    `--ignore-window` 也不豁免：盤後手動補跑時近月早已結算，拒絕送單才是對的。
+    """
+    if today != front.delivery_date:
+        return None
+    return orders.ExpiryGuard(
+        force_at=dt.time.fromisoformat(config.EXPIRY_FORCE_TIME),
+        hard_stop=dt.time.fromisoformat(config.EXPIRY_HARD_STOP),
+        timeout_secs=config.EXPIRY_ORDER_TIMEOUT_SECS,
+        now_fn=_now)
 
 
 def _write_roll_spread(today, front, nxt, q_front, q_next, roll) -> None:

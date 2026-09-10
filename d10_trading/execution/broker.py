@@ -101,6 +101,8 @@ class BrokerInterface:
 
     def place_limit(self, code: str, action: str, quantity: int,
                     price: float) -> OrderHandle: raise NotImplementedError
+    def place_market_range(self, code: str, action: str,
+                           quantity: int) -> OrderHandle: raise NotImplementedError
     def place_combo_roll(self, sell_code: str, buy_code: str, quantity: int,
                          net_price: float) -> OrderHandle: raise NotImplementedError
     def update_price(self, handle: OrderHandle, price: float) -> None: raise NotImplementedError
@@ -442,6 +444,31 @@ class ShioajiBroker(BrokerInterface):
         trade = self._api.place_order(self._contract_obj(code), order)
         return OrderHandle(code=code, action=action, quantity=quantity,
                            price=price, raw=trade)
+
+    def place_market_range(self, code: str, action: str,
+                           quantity: int) -> OrderHandle:
+        """一定範圍市價（MKP）單腳委託——**僅供結算日截止前的強制轉倉**。
+
+        🔴 規格 §5 禁用市價單，此處為明列的例外（見 README §8）：適用範圍限於
+        「近月最後交易日、限價路徑已耗盡、且尚未到 EXPIRY_HARD_STOP」。
+        理由是替代方案更糟——把近月帶進現金結算，成交價完全不受控且無委託軌跡。
+
+        MKP 有價格保護：交易所轉換為「同買賣別最佳一檔 ± 一定範圍點數」的限價，
+        故**不保證成交**（價差大於該點數時不成交），呼叫端必須驗證成交結果。
+        price 送 0（不指定價格）。
+        """
+        sj = self._sj
+        order = sj.FuturesOrder(
+            price=0, quantity=quantity,
+            action=sj.Action.Buy if action == "Buy" else sj.Action.Sell,
+            price_type=sj.FuturesPriceType.MKP,
+            order_type=sj.OrderType.ROD,
+            octype=sj.FuturesOCType.Auto,
+            account=self._api.futopt_account)
+        audit("order_submit_mkp", code=code, action=action, quantity=quantity)
+        trade = self._api.place_order(self._contract_obj(code), order)
+        return OrderHandle(code=code, action=action, quantity=quantity,
+                           price=0.0, raw=trade)
 
     def place_combo_roll(self, sell_code: str, buy_code: str, quantity: int,
                          net_price: float) -> OrderHandle:

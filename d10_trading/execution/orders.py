@@ -11,9 +11,11 @@
 """
 from __future__ import annotations
 
+import datetime as dt
 import logging
 import time
 from dataclasses import dataclass, field
+from typing import Callable
 
 from d10_trading import config
 from d10_trading.execution.broker import BrokerInterface, OrderHandle, Quote
@@ -25,6 +27,32 @@ _TICK = config.TICK_POINTS
 _TOL = config.PRICE_TOLERANCE_TICKS * _TICK
 
 TERMINAL = {"Filled", "Cancelled", "Failed"}
+
+
+@dataclass
+class ExpiryGuard:
+    """近月最後交易日的轉倉時序護欄（見 config「結算日轉倉時序護欄」）。
+
+    到期月份契約該日只到 13:30，而限價流程最壞情況會撞線；撞線的失敗是無聲的
+    （近月由現金結算平倉、次日對帳自洽）。故縮短逾時、設強制轉倉時點與硬性停止。
+    以 `today == front.delivery_date` 建構，因此同時涵蓋 expiry_roll 與當日觸發的
+    late_roll——用日期而非 roll.reason 判定。
+    """
+    force_at: dt.time
+    hard_stop: dt.time
+    timeout_secs: float
+    now_fn: Callable[[], dt.datetime]
+
+    def past(self, mark: dt.time) -> bool:
+        return self.now_fn().time() >= mark
+
+    def may_send(self) -> bool:
+        """是否還可以送新單（未到硬性停止）。"""
+        return not self.past(self.hard_stop)
+
+
+def _timeout(guard: "ExpiryGuard | None") -> float:
+    return guard.timeout_secs if guard else config.ORDER_TIMEOUT_SECS
 
 # 價差單成交淨價與報價月差的容許偏離（點）。8/12 兩腳實測滑價 4.67 點，
 # 組合單應更小；20 點足以放行正常滑價，又能抓出正負號慣例錯誤（量級為 2×月差）。
@@ -80,11 +108,18 @@ def _await_fill(broker: BrokerInterface, handle: OrderHandle,
 
 
 def execute_limit(broker: BrokerInterface, code: str, action: str,
-                  quantity: int, *, sleep_fn=time.sleep) -> ExecutionReport:
-    """單腳限價單：掛單 → 逾時改價一次 → 仍未成交撤單告警。"""
+                  quantity: int, *, sleep_fn=time.sleep,
+                  guard: "ExpiryGuard | None" = None) -> ExecutionReport:
+    """單腳限價單：掛單 → 逾時改價一次 → 仍未成交撤單告警。
+
+    guard 存在（近月最後交易日）時逾時較短，且已過硬性停止就不再送單。
+    """
     rep = ExecutionReport(ok=False)
     if quantity <= 0:
         rep.ok = True
+        return rep
+    if guard is not None and not guard.may_send():
+        rep.alerts.append(f"已過硬性停止時點，不送 {action} {code} x{quantity}")
         return rep
 
     q = broker.quote(code)
@@ -92,7 +127,7 @@ def execute_limit(broker: BrokerInterface, code: str, action: str,
     log.info("下單 %s %s x%d 限價 %.0f（bid=%.0f ask=%.0f）",
              action, code, quantity, price, q.bid, q.ask)
     handle = broker.place_limit(code, action, quantity, price)
-    st = _await_fill(broker, handle, config.ORDER_TIMEOUT_SECS, sleep_fn)
+    st = _await_fill(broker, handle, _timeout(guard), sleep_fn)
 
     if st.status not in TERMINAL:                       # 逾時 → 改價一次
         q2 = broker.quote(code)
@@ -105,7 +140,7 @@ def execute_limit(broker: BrokerInterface, code: str, action: str,
                 broker.update_price(handle, price2)
             except Exception as e:  # noqa: BLE001 - 改價失敗照 timeout 流程收尾
                 rep.alerts.append(f"改價失敗（{e}），續等原單")
-        st = _await_fill(broker, handle, config.ORDER_TIMEOUT_SECS, sleep_fn)
+        st = _await_fill(broker, handle, _timeout(guard), sleep_fn)
 
     if st.status not in TERMINAL:                       # 仍未成交 → 撤單
         try:
@@ -134,7 +169,8 @@ def execute_limit(broker: BrokerInterface, code: str, action: str,
 
 def execute_roll(broker: BrokerInterface, near_code: str, next_code: str,
                  near_qty: int, target_qty: int, *,
-                 sleep_fn=time.sleep) -> ExecutionReport:
+                 sleep_fn=time.sleep,
+                 guard: "ExpiryGuard | None" = None) -> ExecutionReport:
     """轉倉（+與再平衡重疊時一次到位）：平近月 near_qty 口、建次月 target_qty 口。
 
     共同口數 min(near_qty, target_qty) 走跨月價差單（或兩腳）；
@@ -144,19 +180,28 @@ def execute_roll(broker: BrokerInterface, near_code: str, next_code: str,
     common = min(near_qty, target_qty)
 
     if common > 0:
-        sub = _roll_common(broker, near_code, next_code, common, sleep_fn)
+        sub = _roll_common(broker, near_code, next_code, common, sleep_fn, guard)
         rep.fills += sub.fills
         rep.alerts += sub.alerts
         if not sub.ok:
             rep.ok = False
-            return rep          # 轉倉腿未完成 → 不做後續調整，告警等明日/人工
+            if guard is None:
+                return rep      # 平日：轉倉腿未完成 → 告警等明日/人工
+            # 🔴 近月最後交易日：「明日」對該合約不存在，必須在 13:30 前收尾，
+            # 否則近月由現金結算平倉、次日對帳自洽而無人察覺。
+            forced = _force_roll_mkp(broker, near_code, next_code,
+                                     target_qty, guard, sleep_fn)
+            rep.fills += forced.fills
+            rep.alerts += forced.alerts
+            rep.ok = forced.ok
+            return rep          # 強制路徑已含次月建倉與差額，不再往下
 
     if target_qty > near_qty:          # 需加碼：差額買在次月
         sub = execute_limit(broker, next_code, "Buy", target_qty - near_qty,
-                            sleep_fn=sleep_fn)
+                            sleep_fn=sleep_fn, guard=guard)
     elif near_qty > target_qty:        # 需減碼：多出的近月直接平掉（不轉）
         sub = execute_limit(broker, near_code, "Sell", near_qty - target_qty,
-                            sleep_fn=sleep_fn)
+                            sleep_fn=sleep_fn, guard=guard)
     else:
         return rep
     rep.fills += sub.fills
@@ -166,17 +211,27 @@ def execute_roll(broker: BrokerInterface, near_code: str, next_code: str,
 
 
 def _roll_common(broker: BrokerInterface, near_code: str, next_code: str,
-                 qty: int, sleep_fn) -> ExecutionReport:
+                 qty: int, sleep_fn,
+                 guard: "ExpiryGuard | None" = None) -> ExecutionReport:
     if config.ROLL_USE_COMBO:
         try:
-            return _roll_via_combo(broker, near_code, next_code, qty, sleep_fn)
+            return _roll_via_combo(broker, near_code, next_code, qty, sleep_fn,
+                                   guard)
         except Exception as e:  # noqa: BLE001 - 價差單不可用 → 退回兩腳
             log.warning("跨月價差單失敗（%s），退回兩腳分開下", e)
-    return _roll_two_legs(broker, near_code, next_code, qty, sleep_fn)
+    # 近月最後交易日且已過強制轉倉時點 → 不再開啟耗時的兩腳限價流程，
+    # 直接回報未完成，由 execute_roll 走一定範圍市價強制收尾。
+    if guard is not None and guard.past(guard.force_at):
+        rep = ExecutionReport(ok=False)
+        rep.alerts.append(
+            f"已過強制轉倉時點 {guard.force_at:%H:%M:%S}，略過兩腳限價流程")
+        return rep
+    return _roll_two_legs(broker, near_code, next_code, qty, sleep_fn, guard)
 
 
 def _roll_via_combo(broker: BrokerInterface, near_code: str, next_code: str,
-                    qty: int, sleep_fn) -> ExecutionReport:
+                    qty: int, sleep_fn,
+                    guard: "ExpiryGuard | None" = None) -> ExecutionReport:
     """跨月價差單：Sell 近月 + Buy 次月，淨價 = 次月 − 近月（買價差）。"""
     rep = ExecutionReport(ok=False)
     qn, qx = broker.quote(near_code), broker.quote(next_code)
@@ -191,18 +246,19 @@ def _roll_via_combo(broker: BrokerInterface, near_code: str, next_code: str,
     # 已部分成交，就會在既有部位之上重複建倉、曝險加倍（2026-09-02 首次真實
     # 價差單前的審查發現）。送出前的例外才屬於 fallback 的職責範圍。
     try:
-        st = _await_fill(broker, handle, config.ORDER_TIMEOUT_SECS, sleep_fn)
+        st = _await_fill(broker, handle, _timeout(guard), sleep_fn)
         if st.status not in TERMINAL:           # 組合單不能改價 → 撤單重下一次
             broker.cancel(handle)
             st = broker.refresh(handle)
-            if st.deal_quantity == 0:
+            # 已過強制轉倉時點就不再重下（改由一定範圍市價收尾）
+            retry_ok = guard is None or not guard.past(guard.force_at)
+            if st.deal_quantity == 0 and retry_ok:
                 qn, qx = broker.quote(near_code), broker.quote(next_code)
                 net2 = ((qx.ask if qx.ask > 0 else qx.price)
                         - (qn.bid if qn.bid > 0 else qn.price)) + 2 * _TOL
                 log.info("價差單逾時，重下淨價限 %.0f", net2)
                 handle = broker.place_combo_roll(near_code, next_code, qty, net2)
-                st = _await_fill(broker, handle, config.ORDER_TIMEOUT_SECS,
-                                 sleep_fn)
+                st = _await_fill(broker, handle, _timeout(guard), sleep_fn)
                 if st.status not in TERMINAL:
                     broker.cancel(handle)
                     st = broker.refresh(handle)
@@ -240,12 +296,93 @@ def _roll_via_combo(broker: BrokerInterface, near_code: str, next_code: str,
     return rep
 
 
+def _mkp_leg(broker: BrokerInterface, code: str, action: str, qty: int,
+             guard: "ExpiryGuard", sleep_fn) -> ExecutionReport:
+    """單腳一定範圍市價。MKP 不保證成交（見 config），故驗證成交結果。"""
+    rep = ExecutionReport(ok=False)
+    if qty <= 0:
+        rep.ok = True
+        return rep
+    if not guard.may_send():
+        rep.alerts.append(
+            f"已過硬性停止 {guard.hard_stop:%H:%M:%S}，不送 MKP {action} {code} x{qty}")
+        return rep
+    handle = broker.place_market_range(code, action, qty)
+    st = _await_fill(broker, handle, guard.timeout_secs, sleep_fn)
+    if st.status not in TERMINAL:
+        try:
+            broker.cancel(handle)
+        except Exception as e:  # noqa: BLE001
+            rep.alerts.append(f"MKP 撤單失敗（{e}）——需人工確認委託狀態！")
+        st = broker.refresh(handle)
+    filled = st.deal_quantity
+    audit("order_final", code=code, action=action, status=st.status,
+          filled=filled, requested=qty, avg_price=st.avg_fill_price,
+          order_price=0.0, price_type="MKP")
+    if filled > 0:
+        rep.fills.append(Fill(code=code, action=action, quantity=filled,
+                              requested=qty, price=st.avg_fill_price,
+                              order_price=0.0, note="mkp_forced"))
+    if filled < qty:
+        rep.alerts.append(
+            f"一定範圍市價未足額：{action} {code} {filled}/{qty} 口"
+            "（MKP 轉為「同買賣別最佳一檔 ± 一定範圍點數」限價，價差過大時不成交）")
+    rep.ok = filled == qty
+    return rep
+
+
+def _force_roll_mkp(broker: BrokerInterface, near_code: str, next_code: str,
+                    target_qty: int, guard: "ExpiryGuard",
+                    sleep_fn) -> ExecutionReport:
+    """截止前以兩腳一定範圍市價強制完成轉倉（近月最後交易日專用）。
+
+    🔴 **先平近月、後建次月——與平日相反。** 平日先買次月以免出現曝險空窗，
+    但此刻的綁定約束是近月 13:30 停止交易；短暫空手數秒的風險，遠小於卡著一個
+    即將停止交易的合約。
+
+    以券商**實際部位**重新計算需求，不沿用前面各次嘗試的成交統計——部分成交、
+    撤單失敗等情形下那些統計可能不完整，而實際部位是唯一權威。
+    """
+    rep = ExecutionReport(ok=False)
+    try:
+        pos = {p.code: p.quantity for p in broker.positions()}
+    except Exception as e:  # noqa: BLE001
+        rep.alerts.append(f"強制轉倉前查詢部位失敗（{e}）——未送任何單，請人工處理")
+        return rep
+    near_held = int(pos.get(near_code, 0))
+    next_held = int(pos.get(next_code, 0))
+    log.warning("結算日強制轉倉：近月 %s 尚有 %d 口、次月 %s 已有 %d 口（目標 %d）",
+                near_code, near_held, next_code, next_held, target_qty)
+    audit("expiry_force_roll", near=near_code, near_held=near_held,
+          next=next_code, next_held=next_held, target=target_qty)
+
+    near_ok = True
+    if near_held > 0:
+        leg = _mkp_leg(broker, near_code, "Sell", near_held, guard, sleep_fn)
+        rep.fills += leg.fills
+        rep.alerts += leg.alerts
+        near_ok = leg.ok
+        if not near_ok:
+            rep.alerts.append(
+                f"🔴 近月 {near_code} 未能平倉且已無時間重試——將於 13:30 由現金"
+                "結算自動平倉（成交價＝當日 13:00–13:30 標的指數簡單算術平均，"
+                "不受控制）。請至券商 App 確認結算結果與次月部位")
+    leg2 = _mkp_leg(broker, next_code, "Buy", target_qty - next_held,
+                    guard, sleep_fn)
+    rep.fills += leg2.fills
+    rep.alerts += leg2.alerts
+    rep.ok = near_ok and leg2.ok
+    return rep
+
+
 def _roll_two_legs(broker: BrokerInterface, near_code: str, next_code: str,
-                   qty: int, sleep_fn) -> ExecutionReport:
+                   qty: int, sleep_fn,
+                   guard: "ExpiryGuard | None" = None) -> ExecutionReport:
     """兩腳分開：先下流動性差的次月（買），成交後立即補近月（賣）。"""
     rep = ExecutionReport(ok=False)
     t0 = time.monotonic()
-    leg1 = execute_limit(broker, next_code, "Buy", qty, sleep_fn=sleep_fn)
+    leg1 = execute_limit(broker, next_code, "Buy", qty, sleep_fn=sleep_fn,
+                         guard=guard)
     rep.fills += leg1.fills
     rep.alerts += leg1.alerts
     filled1 = leg1.filled_qty
@@ -253,7 +390,8 @@ def _roll_two_legs(broker: BrokerInterface, near_code: str, next_code: str,
         rep.alerts.append("轉倉第一腳（買次月）未成交，近月未動，今日放棄")
         return rep
     # 第二腳只平掉第一腳實際建立的口數，保持兩腳對稱
-    leg2 = execute_limit(broker, near_code, "Sell", filled1, sleep_fn=sleep_fn)
+    leg2 = execute_limit(broker, near_code, "Sell", filled1, sleep_fn=sleep_fn,
+                         guard=guard)
     rep.fills += leg2.fills
     rep.alerts += leg2.alerts
     gap = time.monotonic() - t0
