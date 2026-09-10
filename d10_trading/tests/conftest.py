@@ -92,6 +92,7 @@ class FakeBroker(BrokerInterface):
         self.fill_mode = fill_mode
         self.combo_fill_mode = combo_fill_mode or fill_mode
         self.combo_raises = combo_raises
+        self.mkp_fill_mode = "fill"        # MKP 不保證成交，可獨立設為 never
         self.placed: list[OrderHandle] = []
         self.login_count = 0
 
@@ -135,6 +136,16 @@ class FakeBroker(BrokerInterface):
     def place_limit(self, code, action, quantity, price) -> OrderHandle:
         h = OrderHandle(code=code, action=action, quantity=quantity, price=price)
         self._mk_order(h, self.fill_mode)
+        return h
+
+    def place_market_range(self, code, action, quantity) -> OrderHandle:
+        """一定範圍市價樁。以 mkp_fill_mode 獨立控制——真實 MKP **不保證成交**
+        （轉為「最佳一檔 ± 一定範圍點數」限價），測試必須能模擬未成交。
+        成交價取當時報價（模擬掃到對手價）。"""
+        h = OrderHandle(code=code, action=action, quantity=quantity,
+                        price=self.quotes[code].price)
+        self._mk_order(h, self.mkp_fill_mode)
+        h.price = 0.0                      # MKP 送出時不指定價格
         return h
 
     def place_combo_roll(self, sell_code, buy_code, quantity, net_price):
@@ -229,6 +240,9 @@ def _isolate_var(tmp_path, monkeypatch):
     monkeypatch.setattr(config, "STATE_FILE", tmp_path / "var" / "state.json")
     monkeypatch.setattr(config, "KILL_SWITCH_FILE", tmp_path / "KILL_SWITCH")
     monkeypatch.setattr(config, "ORDER_TIMEOUT_SECS", 0.05)
+    # 結算日護欄的逾時也必須縮短——漏掉會讓 never-fill 的測試真的睡 45 秒/次，
+    # 整組由 11 秒變成 4 分 42 秒（2026-09-10 實測）。跑得慢的測試等於沒人跑。
+    monkeypatch.setattr(config, "EXPIRY_ORDER_TIMEOUT_SECS", 0.05)
     monkeypatch.setattr(config, "ORDER_POLL_SECS", 0)
     # 測試絕不觸網：清空通知設定（使用者的 d10_trading/.env 可能已填真實 token）
     monkeypatch.setattr(config, "TELEGRAM_BOT_TOKEN", "")

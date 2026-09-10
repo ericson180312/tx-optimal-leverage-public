@@ -491,3 +491,93 @@ def test_plain_rebalance_stages_no_roll_context(monkeypatch):
     assert run(broker) == 0
     recs = state_mod.load().pending_exec_audit
     assert len(recs) == 1 and recs[0]["roll"] == ""
+
+
+# ── 結算日（近月最後交易日）的轉倉時序護欄 ───────────────────────────────────
+
+EXPIRY_TODAY = dt.date(2026, 8, 19)        # 202608 結算日＝其最後交易日
+
+
+def _expiry_scenario(monkeypatch, hhmmss: str, *, spread=20.0,
+                     combo_fill="fill", mkp_fill="fill"):
+    """結算日情境：持近月 3 口，時鐘固定在指定時刻。"""
+    from zoneinfo import ZoneInfo
+    broker = setup_scenario(monkeypatch, today=EXPIRY_TODAY, spread=spread)
+    broker.combo_fill_mode = combo_fill
+    broker.mkp_fill_mode = mkp_fill
+    h, m, s = (int(x) for x in hhmmss.split(":"))
+    fixed = dt.datetime.combine(EXPIRY_TODAY, dt.time(h, m, s),
+                                tzinfo=ZoneInfo(config.TIMEZONE))
+    monkeypatch.setattr(main_mod, "_now", lambda: fixed)
+    return broker
+
+
+def test_expiry_guard_only_on_last_trading_day(monkeypatch):
+    """🔴 護欄只在近月最後交易日建立——其他日行為必須完全不變。"""
+    broker = setup_scenario(monkeypatch, today=ROLL_TODAY)
+    front, _ = broker.front_and_next(config.PRODUCT, ROLL_TODAY)
+    assert main_mod._expiry_guard(ROLL_TODAY, front) is None
+    front2, _ = broker.front_and_next(config.PRODUCT, EXPIRY_TODAY)
+    g = main_mod._expiry_guard(EXPIRY_TODAY, front2)
+    assert g is not None
+    assert g.timeout_secs == config.EXPIRY_ORDER_TIMEOUT_SECS
+    assert g.force_at == dt.time.fromisoformat(config.EXPIRY_FORCE_TIME)
+
+
+def test_expiry_limit_path_succeeds_no_mkp(monkeypatch):
+    """限價路徑成功 → 不動用一定範圍市價（MKP 只是後備）。"""
+    broker = _expiry_scenario(monkeypatch, "13:21:00")
+    assert run(broker, today=EXPIRY_TODAY) == 0
+    assert [h for h in broker.placed if h.is_combo], "應走價差單"
+    assert not any(h.price == 0.0 for h in broker.placed), "不該出現 MKP"
+    st = state_mod.load()
+    assert st.positions[0].month == "202609" and st.total_qty() == 3
+
+
+def test_expiry_past_force_time_goes_straight_to_mkp(monkeypatch):
+    """🔴 已過強制轉倉時點：略過耗時的兩腳限價流程，直接兩腳 MKP。"""
+    broker = _expiry_scenario(monkeypatch, "13:27:30", combo_fill="never")
+    assert run(broker, today=EXPIRY_TODAY) == 0
+    mkp = [h for h in broker.placed if h.price == 0.0]
+    assert len(mkp) == 2, f"應恰兩腳 MKP，實際 {len(mkp)}"
+    # 🔴 先平近月、後建次月（與平日相反：近月才有 13:30 死線）
+    assert (mkp[0].action, mkp[0].code) == ("Sell", "TMF202608")
+    assert (mkp[1].action, mkp[1].code) == ("Buy", "TMF202609")
+    st = state_mod.load()
+    assert st.positions[0].month == "202609" and st.total_qty() == 3
+
+
+def test_expiry_mkp_unfilled_alerts_cash_settlement(monkeypatch):
+    """MKP 不保證成交（轉為最佳一檔±範圍點數的限價）→ 未成交須明確告警,
+    說明近月將由現金結算平倉、價格不受控制。"""
+    sent: list[tuple[str, str]] = []
+    monkeypatch.setattr(main_mod.notify, "send",
+                        lambda level, text: sent.append((level, text)))
+    broker = _expiry_scenario(monkeypatch, "13:27:30",
+                              combo_fill="never", mkp_fill="never")
+    assert run(broker, today=EXPIRY_TODAY) == 1        # 告警停止
+    texts = " ".join(t for _, t in sent)
+    assert "現金結算" in texts and "不受控制" in texts
+    assert any(lv == "ALERT" for lv, _ in sent)
+
+
+def test_expiry_past_hard_stop_sends_nothing(monkeypatch):
+    """🔴 已過硬性停止時點：一張單都不能送（近月早已停止交易）。"""
+    broker = _expiry_scenario(monkeypatch, "13:29:00", combo_fill="never")
+    assert run(broker, today=EXPIRY_TODAY) == 1
+    assert not any(h.price == 0.0 for h in broker.placed), "不得送出任何 MKP"
+
+
+def test_expiry_force_reuses_actual_positions(monkeypatch):
+    """強制轉倉以券商實際部位計算需求,不沿用先前嘗試的成交統計。
+
+    先讓價差單部分成交 2/3（近月剩 1、次月已有 2）,再走強制路徑:
+    應只賣 1 口近月、買 1 口次月。
+    """
+    broker = _expiry_scenario(monkeypatch, "13:27:30", combo_fill="partial:2")
+    assert run(broker, today=EXPIRY_TODAY) == 0
+    mkp = [h for h in broker.placed if h.price == 0.0]
+    assert [(h.action, h.code, h.quantity) for h in mkp] == [
+        ("Sell", "TMF202608", 1), ("Buy", "TMF202609", 1)]
+    st = state_mod.load()
+    assert st.positions[0].month == "202609" and st.total_qty() == 3
