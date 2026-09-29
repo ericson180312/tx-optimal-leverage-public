@@ -42,7 +42,7 @@
    用 `-d` 而非 `-D`——被拒絕代表還有未合併的 commit，那是保護不是阻礙。
    （合併點已有 tag 與 merge commit 記錄，分支 ref 留著只會被誤用成雜項工作的暫存區。）
 
-**驗收前先確認**：工作區乾淨。跑回測常會順手更新 `data/`、`backtest_multimarket/data/`
+**驗收前先確認**：工作區乾淨。跑回測常會順手更新資料快取目錄（公開版未隨附）
 的 parquet 快取，那些與本次改動無關，提交前用 `git checkout --` 還原。
 
 ## 直接 push main vs 走 PR

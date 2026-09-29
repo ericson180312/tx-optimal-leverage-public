@@ -169,12 +169,11 @@ Unregister-ScheduledTask D10_daily -Confirm:$false     # 移除排程
 | **關機 / 休眠斷電** | ❌ | 無法喚醒；開機後 `StartWhenAvailable` 會補跑，但已過執行時間窗 → 拒單告警（= 今日已略過通知），次一交易日自動恢復 |
 
 若未來需要「登出也能跑」，須改用 `Password` 登入類型（註冊時存 Windows
-密碼）；但該場景更適合直接走 [deploy/README.md](../deploy/README.md) 的
-VPS 方案（systemd 不依賴登入 session）。
+密碼）；但該場景更適合改用 VPS（systemd 不依賴登入 session）。
 
-**Linux / 雲端 VPS**：完整部署 runbook 見 [deploy/README.md](../deploy/README.md)
-（systemd oneshot + timer、uv 鎖版環境、healthchecks 心跳、切換程序——
-🔴 切換時絕不允許雙機同時排程）。
+**Linux / 雲端 VPS**：systemd oneshot + timer、uv 鎖版環境、healthchecks 心跳。
+🔴 由本機切換到 VPS 時絕不允許雙機同時排程。
+（部署 runbook 含主機位址與帳號，**未隨公開版散布**。）
 
 手動執行 / 測試：
 ```

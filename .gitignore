@@ -19,3 +19,7 @@ d10_trading/KILL_SWITCH
 
 # Claude Code 本機設定（含 email 與本機許可紀錄，不應進入 repo）
 .claude/settings.local.json
+
+# 市場資料快取：第三方資料，公開版不散布（授權未確認）
+data/
+backtest_multimarket/data/
