@@ -16,3 +16,6 @@ d10_trading/KILL_SWITCH
 
 # 憑證
 *.pfx
+
+# Claude Code 本機設定（含 email 與本機許可紀錄，不應進入 repo）
+.claude/settings.local.json
