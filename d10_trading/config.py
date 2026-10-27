@@ -186,7 +186,7 @@ RISK_INDICATOR_CRITICAL = 100.0
 EXPIRY_DATES: dict[str, dt.date] = {
     "永豐 CA 憑證":     dt.date(2028, 7, 15),
     "Shioaji API 金鑰": dt.date(2027, 7, 15),
-    "Vultr 信用卡":     dt.date(2031, 10, 31),   # 卡片於當月月底失效
+    "Vultr 信用卡":     dt.date(2099, 12, 31),   # 公開版示意值（實際到期日不公開）
 }
 EXPIRY_WARN_DAYS = 60        # ≤60 天 → WARNING（每週一推播，避免告警疲勞）
 EXPIRY_ALERT_DAYS = 14       # ≤14 天 → ALERT（每日推播）；已過期 → CRITICAL
