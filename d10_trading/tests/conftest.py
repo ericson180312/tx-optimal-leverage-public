@@ -252,6 +252,18 @@ def _isolate_var(tmp_path, monkeypatch):
     yield
 
 
+@pytest.fixture
+def temp_holiday_file(tmp_path, monkeypatch):
+    """獨立的假日檔副本，避免測試污染 repo 內的正式檔。"""
+    src = config.HOLIDAY_FILE.read_text(encoding="utf-8")
+    dst = tmp_path / "taifex_holidays.csv"
+    dst.write_text(src, encoding="utf-8")
+    monkeypatch.setattr(config, "HOLIDAY_FILE", dst)
+    calendar.reload()
+    yield dst
+    calendar.reload()
+
+
 def make_contracts(product: str, months: list[str],
                    references: dict[str, float] | None = None) -> list[ContractInfo]:
     references = references or {}

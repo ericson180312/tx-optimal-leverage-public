@@ -226,3 +226,80 @@ def test_contract_exists_check_failure_falls_back_to_normal(monkeypatch):
                         contract_exists_fn=boom)
     assert ss.has_provisional
     assert not [w for w in ss.warnings if "已結算下市" in w]
+
+
+# ── 臨時停市查證（2026-10-23 颱風後新增）─────────────────────────────────────
+# 停市後第一個交易日，「上一交易日」若是未補登的停市日，FinMind 本來就不會有那天；
+# 不查證的話，單日遞補會以停市前的結算價補出一列假的平盤、偏移 5 日檢查相位。
+
+def _lagging_cdf(monkeypatch, days_missing=1):
+    end = PREV
+    for _ in range(days_missing):
+        end = calendar.prev_trading_day(end)
+    cdf = _cdf(end=end)
+    monkeypatch.setattr(series, "load_tx_contracts", lambda **kw: cdf)
+    return end
+
+
+def test_verified_closure_recorded_instead_of_fake_row(monkeypatch, temp_holiday_file):
+    last = _lagging_cdf(monkeypatch)                    # FinMind 無 7/15（視為颱風停市）
+    ss = prepare_series(TODAY, prev_settlement_fn=lambda m: 46000.0,
+                        day_traded_fn=lambda d: d != PREV)
+    assert ss.closures_recorded == [PREV]
+    assert not calendar.is_trading_day(PREV)            # 已補登假日檔
+    assert PREV not in ss.dates                         # 沒有假的平盤列
+    assert ss.last_official_date == last == calendar.prev_trading_day(TODAY)
+    assert not any("暫代" in w for w in ss.warnings)
+    assert any("補登臨時停市" in w for w in ss.warnings)
+
+
+def test_consecutive_closures_walk_back(monkeypatch, temp_holiday_file):
+    """連續兩日停市：逐日往前查證並補登，不因「落後兩日」而誤判資料過期。"""
+    last = _lagging_cdf(monkeypatch, days_missing=2)
+    gap = {PREV, calendar.prev_trading_day(PREV)}
+    ss = prepare_series(TODAY, prev_settlement_fn=lambda m: 46000.0,
+                        day_traded_fn=lambda d: d not in gap)
+    assert set(ss.closures_recorded) == gap
+    assert ss.last_official_date == last
+
+
+def test_traded_day_keeps_normal_fallback(monkeypatch, temp_holiday_file):
+    """查證為有成交（FinMind 單純晚到）→ 照原流程以參考價遞補，不動假日檔。"""
+    _lagging_cdf(monkeypatch)
+    before = temp_holiday_file.read_text(encoding="utf-8")
+    ss = prepare_series(TODAY, prev_settlement_fn=lambda m: 46200.0,
+                        day_traded_fn=lambda d: True)
+    assert ss.closures_recorded == []
+    assert ss.last_official_date == PREV and any("暫代" in w for w in ss.warnings)
+    assert temp_holiday_file.read_text(encoding="utf-8") == before
+
+
+def test_unknown_verification_keeps_normal_fallback(monkeypatch, temp_holiday_file):
+    """查證失敗（None）不得當成停市——寧可照舊遞補，也不把交易日誤登為假日。"""
+    _lagging_cdf(monkeypatch)
+    ss = prepare_series(TODAY, prev_settlement_fn=lambda m: 46200.0,
+                        day_traded_fn=lambda d: None)
+    assert ss.closures_recorded == []
+    assert calendar.is_trading_day(PREV)
+    assert ss.last_official_date == PREV
+
+
+def test_closure_not_recorded_when_sync_disabled(monkeypatch, temp_holiday_file):
+    monkeypatch.setattr(config, "HOLIDAY_SYNC_ENABLED", False)
+    _lagging_cdf(monkeypatch)
+    ss = prepare_series(TODAY, prev_settlement_fn=lambda m: 46200.0,
+                        day_traded_fn=lambda d: False)
+    assert ss.closures_recorded == []
+    assert ss.last_official_date == PREV                # 退回原流程
+
+
+def test_no_verification_when_series_is_current(monkeypatch):
+    """序列已到上一交易日 → 不需查證（也不該多打 API）。"""
+    monkeypatch.setattr(series, "load_tx_contracts", lambda **kw: _cdf())
+
+    def must_not_call(d):
+        raise AssertionError("不應查證")
+
+    ss = prepare_series(TODAY, prev_settlement_fn=lambda m: 46000.0,
+                        day_traded_fn=must_not_call)
+    assert ss.closures_recorded == []

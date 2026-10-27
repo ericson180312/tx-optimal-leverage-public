@@ -581,3 +581,91 @@ def test_expiry_force_reuses_actual_positions(monkeypatch):
         ("Sell", "TMF202608", 1), ("Buy", "TMF202609", 1)]
     st = state_mod.load()
     assert st.positions[0].month == "202609" and st.total_qty() == 3
+
+
+# ── 臨時停市偵測（2026-10-23 颱風後新增）─────────────────────────────────────
+# 10/23 實況：假日檔沒有這天 → 批次照常執行、Telegram 只有一般摘要。若當天剛好
+# 需要交易，委託會送進休市的市場。13:20 先以近月最後成交時間確認今日真的在交易。
+
+def _set_last_trade(broker, hhmm: str, day=TODAY):
+    h, m = (int(x) for x in hhmm.split(":"))
+    for q in broker.quotes.values():
+        q.ts = dt.datetime.combine(day, dt.time(h, m))
+
+
+def _capture(monkeypatch):
+    sent: list[tuple[str, str]] = []
+    monkeypatch.setattr(main_mod.notify, "send",
+                        lambda level, text: sent.append((level, text)))
+    return sent
+
+
+def _audit_events():
+    import json
+    p = config.LOG_DIR / "audit.jsonl"
+    if not p.exists():
+        return []
+    return [json.loads(x)["event"] for x in p.read_text(encoding="utf-8").splitlines()]
+
+
+def test_closed_market_places_no_orders(monkeypatch):
+    """🔴 最後成交是當天凌晨的夜盤（10/23 即 04:59）→ 日盤沒開：不下單、不標記已執行。"""
+    broker = setup_scenario(monkeypatch, held_qty=0)    # 正常情況會建倉 3 口
+    _set_last_trade(broker, "04:59")
+    _at(monkeypatch, "13:20")
+    sent = _capture(monkeypatch)
+    assert run_daily(broker, today=TODAY) == 0          # 不是系統故障：心跳照常 OK
+    assert broker.placed == []
+    assert state_mod.load().executed_date is None       # 若誤判，13:40 前可手動重跑
+    assert any(lv == "WARNING" and "疑似臨時停市" in t for lv, t in sent)
+    assert "market_closed_suspected" in _audit_events()
+    assert not (config.LOG_DIR / "daily_summary.csv").exists()   # 不留休市日的假摘要
+
+
+def test_stalled_quotes_place_no_orders(monkeypatch):
+    """開盤後有成交、但已半小時以上沒有新成交 → 疑似盤中停市或報價中斷。"""
+    broker = setup_scenario(monkeypatch, held_qty=0)
+    _set_last_trade(broker, "12:40")
+    _at(monkeypatch, "13:20")
+    sent = _capture(monkeypatch)
+    assert run_daily(broker, today=TODAY) == 0
+    assert broker.placed == []
+    assert any("盤中停市或報價中斷" in t for _, t in sent)
+
+
+def test_live_market_trades_normally(monkeypatch):
+    broker = setup_scenario(monkeypatch, held_qty=0)
+    _set_last_trade(broker, "13:19")
+    _at(monkeypatch, "13:20")
+    assert run_daily(broker, today=TODAY) == 0
+    assert len(broker.placed) == 1
+    assert state_mod.load().executed_date == TODAY.isoformat()
+    assert "market_closed_suspected" not in _audit_events()
+
+
+def test_closure_check_skipped_outside_day_session(monkeypatch):
+    """盤外執行（開機補跑等）本來就沒有新成交，不可誤判為停市。"""
+    broker = setup_scenario(monkeypatch)
+    _set_last_trade(broker, "04:59")
+    _at(monkeypatch, "02:15")
+    assert run_daily(broker, today=TODAY) == 0
+    assert "market_closed_suspected" not in _audit_events()
+
+
+def test_dry_run_on_closed_market_only_warns(monkeypatch):
+    broker = setup_scenario(monkeypatch, held_qty=0)
+    _set_last_trade(broker, "04:59")
+    _at(monkeypatch, "13:20")
+    sent = _capture(monkeypatch)
+    assert run_daily(broker, today=TODAY, dry_run=True) == 0
+    assert broker.placed == []
+    assert any("疑似臨時停市" in t for _, t in sent)
+    assert "market_closed_suspected" in _audit_events()
+
+
+def test_missing_trade_time_does_not_block(monkeypatch):
+    """取不到最後成交時間（舊版或查詢欄位缺漏）→ 不擋，維持原流程。"""
+    broker = setup_scenario(monkeypatch, held_qty=0)    # flat_quote 的 ts 為 None
+    _at(monkeypatch, "13:20")
+    assert run_daily(broker, today=TODAY) == 0
+    assert len(broker.placed) == 1

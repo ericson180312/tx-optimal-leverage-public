@@ -13,17 +13,7 @@ from d10_trading import config
 from d10_trading.data import calendar, holiday_sync
 from d10_trading.data.holiday_sync import SanityError
 
-
-@pytest.fixture
-def temp_holiday_file(tmp_path, monkeypatch):
-    """獨立的假日檔副本，避免測試污染 repo 內的正式檔。"""
-    src = config.HOLIDAY_FILE.read_text(encoding="utf-8")
-    dst = tmp_path / "taifex_holidays.csv"
-    dst.write_text(src, encoding="utf-8")
-    monkeypatch.setattr(config, "HOLIDAY_FILE", dst)
-    calendar.reload()
-    yield dst
-    calendar.reload()
+# temp_holiday_file fixture 定義於 conftest（序列層的停市查證測試也要用）。
 
 
 # ── TWSE 解析規則 ───────────────────────────────────────────────────────────
@@ -230,3 +220,21 @@ def test_adhoc_ignores_dates_before_data_starts(temp_holiday_file):
     added = holiday_sync.record_adhoc_closures(actual, since=dt.date(2026, 7, 1))
     assert added == [dt.date(2026, 7, 10)]                      # 只有真正的缺口
     assert dt.date(2026, 7, 1) not in added                     # 資料起點前不列入
+
+
+# ── 分 K 查證的臨時停市補登（2026-10-23 颱風後新增）──────────────────────────
+
+def test_record_verified_closure_adds_and_is_idempotent(temp_holiday_file):
+    day = dt.date(2026, 10, 22)                                  # 真實交易日，僅供測試
+    assert calendar.is_trading_day(day)
+    assert holiday_sync.record_verified_closure(day) is True
+    assert not calendar.is_trading_day(day)                     # 已生效（快取已清）
+    assert "Shioaji 分K" in temp_holiday_file.read_text(encoding="utf-8")
+    assert holiday_sync.record_verified_closure(day) is True    # 已在檔內 → 仍回 True
+
+
+def test_record_verified_closure_respects_disable(temp_holiday_file, monkeypatch):
+    monkeypatch.setattr(config, "HOLIDAY_SYNC_ENABLED", False)
+    day = dt.date(2026, 10, 22)
+    assert holiday_sync.record_verified_closure(day) is False
+    assert calendar.is_trading_day(day)

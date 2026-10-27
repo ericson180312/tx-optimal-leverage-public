@@ -176,3 +176,55 @@ def test_avg_deal_price_weighted_and_empty():
     assert _avg_deal_price([_deal(100, 2), _deal(110, 3)]) == (106.0, 5)
     assert _avg_deal_price([]) == (0.0, 0)
     assert _avg_deal_price([_deal(0, 5), _deal(100, 0)]) == (0.0, 0)   # 無效值略過
+
+
+# ── Shioaji 時間戳與分 K 停市查證（2026-10-23 颱風後新增）──────────────────────
+
+def _ns(t: dt.datetime) -> int:
+    """台北本地時間 → Shioaji 時間戳（本地時間當成 UTC 編碼）。"""
+    return (t - dt.datetime(1970, 1, 1)) // dt.timedelta(microseconds=1) * 1000
+
+
+def test_sj_local_ts_reads_local_time_encoded_as_utc():
+    """🔴 2026-10-25 實測值：10/23 颱風停市前最後一筆成交（夜盤 04:59:59）。
+    以主機時區（CST）解讀會得 12:59:59——看起來像日盤中午有成交，停市偵測即失效。"""
+    from d10_trading.execution.broker import _sj_local_ts
+    assert _sj_local_ts(1792731599576000000) == dt.datetime(2026, 10, 23, 4, 59, 59, 576000)
+    assert _sj_local_ts(None) is None
+    assert _sj_local_ts(0) is None
+    assert _sj_local_ts("x") is None
+
+
+def _kbar_broker(stamps=None, raises=False):
+    b = _broker({"TMFR1": _contract("TMFR1", "202611", "2026/11/18")}, {})
+
+    def kbars(contract, start, end):
+        if raises:
+            raise RuntimeError("quota")
+        return SimpleNamespace(ts=[_ns(t) for t in (stamps or [])])
+
+    b._api.kbars = kbars
+    return b
+
+
+D1023, D1027 = dt.date(2026, 10, 23), dt.date(2026, 10, 27)
+
+
+def test_day_session_traded_false_when_only_overnight_bars():
+    """10/23 實況：當天只有前一夜盤延續到 05:00 的 K 棒，日盤一根都沒有 → 停市。"""
+    night = [dt.datetime(2026, 10, 23, 0, 1) + dt.timedelta(minutes=i) for i in range(300)]
+    later = [dt.datetime(2026, 10, 27, 8, 46), dt.datetime(2026, 10, 27, 13, 19)]
+    assert _kbar_broker(night + later).day_session_traded("TMF", D1023, D1027) is False
+
+
+def test_day_session_traded_true_with_day_bars():
+    bars = [dt.datetime(2026, 10, 23, 4, 59), dt.datetime(2026, 10, 23, 9, 30)]
+    assert _kbar_broker(bars).day_session_traded("TMF", D1023, D1027) is True
+
+
+def test_day_session_traded_unknown_on_empty_or_error(monkeypatch):
+    """完全沒有 K 棒或查詢失敗 → None（不可當成停市，否則會把交易日誤登為假日）。"""
+    from d10_trading import config
+    monkeypatch.setattr(config, "RETRY_BASE_SECS", 0)
+    assert _kbar_broker([]).day_session_traded("TMF", D1023, D1027) is None
+    assert _kbar_broker(raises=True).day_session_traded("TMF", D1023, D1027) is None
