@@ -12,6 +12,8 @@
 - 官方序列最後日期必須 = 上一交易日。FinMind 未更新時，退回 Shioaji **參考價
   （contract.reference = 前日結算價）** 補「暫定官方」列（告警記錄，次日 FinMind
   到位後自動以結算價重建覆蓋）；兩者皆無 → DataStaleError，停止且絕不用舊資料下單。
+  遞補前先以 Shioaji 分 K 查證「上一交易日」真的有日盤成交：沒有 → 臨時停市，
+  補登假日檔並重算上一交易日，不補假列（2026-10-23 颱風後新增）。
 - 雙源核對：上一交易日的 FinMind 結算價 vs Shioaji 參考價（兩者同為 TAIFEX 結算價、
   同口徑），相對差 > DUAL_SOURCE_TOL → 告警。刻意不用日盤 K 棒收盤——13:45 那根是
   「收盤集合競價價」，與結算價有結構性差異（可達 0.3%），比對會誤報（2026-07 實測）。
@@ -25,9 +27,12 @@ import numpy as np
 import pandas as pd
 
 from d10_trading import config
-from d10_trading.data import calendar
+from d10_trading.data import calendar, holiday_sync
 from d10_trading.data.continuous import ContinuousSeries, build_continuous
 from d10_trading.data.finmind import load_tx_contracts
+
+# 臨時停市查證最多往前追溯的交易日數（一週）；超過即視為資料問題，交由新鮮度檢查停止。
+_CLOSURE_LOOKBACK_MAX = 5
 
 
 class DataStaleError(RuntimeError):
@@ -45,6 +50,7 @@ class SignalSeries:
     cs: ContinuousSeries              # 完整面板（稽核）
     warnings: list[str] = field(default_factory=list)
     cdf: pd.DataFrame | None = field(default=None, repr=False)   # 原始 TX 逐合約長表
+    closures_recorded: list[dt.date] = field(default_factory=list)  # 本次查證補登的臨時停市日
 
     def settlement_of(self, contract_month: str, date: dt.date) -> float | None:
         """指定 TX 月份合約在 date 的官方結算價（FinMind）；查無回 None。
@@ -143,7 +149,8 @@ def prepare_series(today: dt.date, *,
                    prev_settlement_fn=None,
                    today_price_fn=None,
                    ref_trustworthy: bool = True,
-                   contract_exists_fn=None) -> SignalSeries:
+                   contract_exists_fn=None,
+                   day_traded_fn=None) -> SignalSeries:
     """日常批次的序列準備（重建 → 新鮮度 → 暫定列）。
 
     prev_settlement_fn(contract_yyyymm) -> float | None
@@ -161,11 +168,30 @@ def prepare_series(today: dt.date, *,
         此時對它查價／查參考價必然失敗。偵測到即以單一明確訊息說明，並略過
         預覽與雙源核對——刻意不改查次月：次月與近月有月差（可達 0.3%），
         代入會使雙源核對假性不一致，並在預覽 spot 插入假跳空而扭曲訊號。
+    day_traded_fn(date) -> bool | None
+        該日日盤是否有成交（臨時停市查證，見下方）。None → 不查證，維持原流程。
     """
     cdf = load_tx_contracts(**(fetch_kwargs or {"force_current_year": True,
                                                 "today": today}))
     ss = build_signal_series(cdf)
     prev_td = calendar.prev_trading_day(today)
+
+    # ── 臨時停市查證（2026-10-23 颱風後新增）─────────────────────────────
+    # 序列落後於「上一交易日」時，先確認那天真的有開盤。未補登的臨時停市會被下方的
+    # 單日遞補誤當成「FinMind 晚一天」，以停市前的結算價補出一列假的平盤，並偏移
+    # 5 日檢查相位。查證為日盤無成交 → 補登假日檔、重算上一交易日（連續多日停市
+    # 逐日往前查）。查證為有成交或無法判定 → 照原流程遞補或停止。
+    if day_traded_fn is not None:
+        for _ in range(_CLOSURE_LOOKBACK_MAX):
+            if ss.last_official_date >= prev_td or day_traded_fn(prev_td) is not False:
+                break
+            if not holiday_sync.record_verified_closure(prev_td):
+                break
+            ss.closures_recorded.append(prev_td)
+            ss.warnings.append(
+                f"假日檔已自動補登臨時停市 {prev_td}（Shioaji 分K：該日日盤無成交）"
+                "——請與期交所公告核對")
+            prev_td = calendar.prev_trading_day(today)
 
     # ── 序列持倉月是否仍可交易（結算後的例行過渡，見 contract_exists_fn）──
     held_tradable = True

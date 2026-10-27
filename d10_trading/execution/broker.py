@@ -99,6 +99,11 @@ class BrokerInterface:
         """風險指標（百分比數值）；不可用（模擬/查詢失敗）回 None。"""
         return None
 
+    def day_session_traded(self, product: str, day: dt.date,
+                           through: dt.date) -> bool | None:
+        """day 當天日盤是否有任何成交（臨時停市查證）；無法判定回 None。"""
+        return None
+
     def place_limit(self, code: str, action: str, quantity: int,
                     price: float) -> OrderHandle: raise NotImplementedError
     def place_market_range(self, code: str, action: str,
@@ -150,6 +155,23 @@ def _avg_deal_price(deals) -> tuple[float, int]:
             tot_px += px * q
             tot_q += q
     return (tot_px / tot_q, int(tot_q)) if tot_q else (0.0, 0)
+
+
+def _sj_local_ts(ns) -> dt.datetime | None:
+    """Shioaji 時間戳（epoch 奈秒）→ 台北本地時間（naive）；無效值回 None。
+
+    🔴 Shioaji 把**台北本地時間當成 UTC** 編碼（快照與分 K 皆然；2026-10-25 實測：
+    10/23 颱風停市前最後一筆成交在夜盤 04:59:59，以 UTC 解讀得 04:59:59，
+    以主機時區 CST 解讀卻得 12:59:59）。誤用後者會把夜盤成交看成日盤中午的成交，
+    臨時停市偵測就會失效——所以一律以 UTC 解讀、不套時區。
+    """
+    try:
+        v = int(ns)
+    except (TypeError, ValueError):
+        return None
+    if v <= 0:
+        return None
+    return dt.datetime(1970, 1, 1) + dt.timedelta(microseconds=v // 1000)
 
 
 def _retry(fn, what: str):
@@ -305,8 +327,33 @@ class ShioajiBroker(BrokerInterface):
                 price=float(snap.close),
                 bid=float(getattr(snap, "buy_price", 0.0) or 0.0),
                 ask=float(getattr(snap, "sell_price", 0.0) or 0.0),
+                ts=_sj_local_ts(getattr(snap, "ts", None)),   # 最後成交時間
             )
         return _retry(_do, f"snapshot {code}")
+
+    def day_session_traded(self, product: str, day: dt.date,
+                           through: dt.date) -> bool | None:
+        """day 當天日盤（DAY_SESSION_OPEN–CLOSE）是否有任何成交；無法判定回 None。
+
+        以 {product}R1 連續月的分 K 查 [day, through]。夜盤跨午夜，所以「day 有 K 棒」
+        不代表有開盤（10/23 颱風停市日仍有前一夜盤延續到 05:00 的 K 棒）——只看日盤時段。
+        整段完全沒有 K 棒時回 None（視為查詢失敗而非停市）：只有「區間內有 K 棒、
+        唯獨 day 的日盤沒有」才回 False，避免 API 空回應把真實交易日誤登為停市。
+        """
+        def _do():
+            k = self._api.kbars(self._contract_obj(f"{product}R1"),
+                                start=day.isoformat(), end=through.isoformat())
+            return list(getattr(k, "ts", None) or [])
+        try:
+            stamps = _retry(_do, f"分K {product} {day}")
+        except BrokerError:
+            return None
+        times = [t for t in (_sj_local_ts(x) for x in stamps) if t is not None]
+        if not times:
+            return None
+        lo = dt.time.fromisoformat(config.DAY_SESSION_OPEN)
+        hi = dt.time.fromisoformat(config.DAY_SESSION_CLOSE)
+        return any(t.date() == day and lo <= t.time() <= hi for t in times)
 
     # ── 帳務 ────────────────────────────────────────────────────────────────
     def equity(self) -> float:

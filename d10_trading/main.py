@@ -133,6 +133,17 @@ def _run_core(broker: BrokerInterface, st, today, now, dry_run, ignore_window,
                           "前日轉倉可能不完整，請人工處理")
         _check_risk_indicator(broker, warnings)
 
+        # ── 1b. 今日是否真的在交易（臨時停市偵測；置於保險絲與下單之前）─────
+        closed = _market_closed_reason(broker, today, now)
+        if closed:
+            audit("market_closed_suspected", reason=closed, dry_run=dry_run)
+            if not dry_run:
+                raise DayStop(closed + "。本日不下單、不標記已執行；請核對期交所公告，"
+                              "若確認有開盤可於 13:40 前手動重跑",
+                              level="WARNING", code=0)
+            warnings.append(closed)
+            notify.send("WARNING", closed)
+
         # ── 2. 保險絲前置檢查（§7：對帳後）────────────────────────────────
         held_month = recon.held_months[0] if recon.held_months else None
         held_qty = recon.total_qty
@@ -162,6 +173,8 @@ def _run_core(broker: BrokerInterface, st, today, now, dry_run, ignore_window,
                     broker.contract_by_month(config.SIGNAL_PRODUCT, m).code).price,
                 ref_trustworthy=ref_ok,
                 contract_exists_fn=lambda m: _tx_contract_exists(broker, m),
+                day_traded_fn=lambda d: broker.day_session_traded(
+                    config.PRODUCT, d, today),
             )
         except DataStaleError as e:
             if fuse_mode:
@@ -170,6 +183,9 @@ def _run_core(broker: BrokerInterface, st, today, now, dry_run, ignore_window,
         warnings.extend(ss.warnings)
         for w in ss.warnings:
             notify.send("WARNING", w)
+        if ss.closures_recorded:
+            audit("adhoc_closure_recorded", source="kbars",
+                  dates=[d.isoformat() for d in ss.closures_recorded])
 
         # 臨時停市自動補登（過去日期，前後皆有實際行情佐證；只增不刪）。
         # 未及時補登會使 prev_trading_day 誤判、序列插入假的一天並偏移訊號相位。
@@ -554,6 +570,41 @@ def _check_risk_indicator(broker: BrokerInterface, warnings: list[str]) -> None:
     msg = f"風險指標 {ri:.0f}%——{note}"
     warnings.append(msg)
     notify.send(level, msg)
+
+
+def _market_closed_reason(broker: BrokerInterface, today: dt.date,
+                          now: dt.datetime) -> str | None:
+    """確認今日日盤確實在交易；疑似停市回傳說明，否則 None。
+
+    依近月最後成交時間（快照 ts）判斷。只看「最後成交日期 = 今天」不夠：夜盤跨午夜，
+    2026-10-23 颱風停市日的最後成交時間戳正是當天 04:59（前一夜盤）。
+    - 開盤後沒有任何成交 → 疑似全日停市；
+    - 最後成交距今超過 MARKET_STALE_MINUTES → 疑似盤中停市或報價中斷。
+    只在日盤時段內判定：盤外執行（開機補跑、手動盤後 dry-run）本來就沒有新成交。
+    取不到時間戳或查詢失敗時不擋，交由下單流程既有的逾時／拒單告警處理。
+    """
+    open_t = dt.time.fromisoformat(config.DAY_SESSION_OPEN)
+    close_t = dt.time.fromisoformat(config.DAY_SESSION_CLOSE)
+    local_now = now.astimezone(ZoneInfo(config.TIMEZONE)).replace(tzinfo=None)
+    if local_now.date() != today or not (open_t < local_now.time() <= close_t):
+        return None
+    try:
+        front, _ = broker.front_and_next(config.PRODUCT, today)
+        last = broker.quote(front.code).ts
+    except Exception as e:  # noqa: BLE001 - 偵測本身失敗不得擋下交易
+        log.warning("開盤確認失敗（略過）：%s", type(e).__name__)
+        return None
+    if last is None:
+        log.warning("取不到 %s 最後成交時間，略過開盤確認", front.code)
+        return None
+    if last < dt.datetime.combine(today, open_t):
+        return (f"近月 {front.code} 今日日盤沒有任何成交（最後成交 {last:%m/%d %H:%M}）"
+                "——疑似臨時停市（颱風等）")
+    idle = (local_now - last).total_seconds() / 60
+    if idle > config.MARKET_STALE_MINUTES:
+        return (f"近月 {front.code} 已 {idle:.0f} 分鐘沒有成交（最後成交 {last:%H:%M}）"
+                "——疑似盤中停市或報價中斷")
+    return None
 
 
 def _check_ca(broker: BrokerInterface) -> None:
