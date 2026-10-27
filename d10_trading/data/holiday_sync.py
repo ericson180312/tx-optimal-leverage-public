@@ -213,3 +213,20 @@ def record_adhoc_closures(actual_days: list[dt.date],
     except Exception as e:  # noqa: BLE001
         log.warning("臨時停市補登失敗（忽略）：%s", type(e).__name__)
         return []
+
+
+def record_verified_closure(day: dt.date) -> bool:
+    """補登一個已由 Shioaji 分 K 查證「日盤無成交」的臨時停市日（只增不刪）。
+
+    回傳 True 表示該日現已列在假日檔（本次新增或原本就在）；停用或寫入失敗回 False，
+    呼叫端應退回原流程。與 record_adhoc_closures 互補：後者要等 FinMind 序列越過
+    停市日才看得到缺口，但停市後的第一個交易日，缺口會先被單日遞補填成假的一列。
+    """
+    if not config.HOLIDAY_SYNC_ENABLED:
+        return False
+    try:
+        merge({day: "臨時停市（Shioaji 分K：日盤無成交，自動補登）"})
+        return not calendar.is_trading_day(day)
+    except Exception as e:  # noqa: BLE001
+        log.warning("臨時停市補登失敗（忽略）：%s", type(e).__name__)
+        return False
