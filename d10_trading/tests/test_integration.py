@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import datetime as dt
+import re
 
 from d10_trading import config
 from d10_trading import main as main_mod
@@ -16,7 +17,10 @@ from d10_trading.execution.broker import PositionInfo
 from d10_trading.main import run_daily
 from d10_trading.ops import state as state_mod
 from d10_trading.ops.state import PositionState, State
-from d10_trading.tests.conftest import FakeBroker, flat_quote, make_contracts, synth_cdf
+from d10_trading.strategy import regime
+from d10_trading.tests.conftest import (
+    FakeBroker, flat_quote, make_contracts, synth_cdf, trading_days,
+)
 
 START = dt.date(2025, 1, 2)
 TODAY = dt.date(2026, 7, 16)               # 週四、非結算週轉倉窗
@@ -104,7 +108,7 @@ def test_initial_entry_buys_target(monkeypatch):
     assert st.total_qty() == 3
 
 
-def test_late_run_after_close_keeps_t_plus_1(monkeypatch):
+def test_late_run_after_close_keeps_t_plus_1(monkeypatch, t_plus_1):
     """收盤後補跑（FinMind 已含今日資料）：執行訊號仍為昨日，行為與 13:20 跑一致。"""
     broker = setup_scenario(monkeypatch, cdf_end=TODAY)   # 官方序列含今日
     assert run(broker) == 0
@@ -583,6 +587,311 @@ def test_expiry_force_reuses_actual_positions(monkeypatch):
     assert st.positions[0].month == "202609" and st.total_qty() == 3
 
 
+# ── 訊號檢查日預覽 ───────────────────────────────────────────────────────────
+
+def _check_day() -> dt.date:
+    """合成序列在 TODAY 之後第一個 t%5==0 的交易日（首日無報酬，序列自次一交易日起算）。"""
+    d = TODAY
+    while (len(trading_days(START, d)) - 2) % config.SIGNAL_CHECK_EVERY != 0:
+        d = calendar.next_trading_day(d)
+    return d
+
+
+def _previews(sent):
+    return [(lv, t) for lv, t in sent if "今日為訊號檢查日" in t]
+
+
+def test_check_day_pushes_gate_and_stays_quiet_otherwise(monkeypatch, t_plus_1):
+    day = _check_day()
+    broker = setup_scenario(monkeypatch, today=day)
+    sent = _capture(monkeypatch)
+    assert run(broker, today=day) == 0
+    assert broker.placed == []
+    ss = build_signal_series(synth_cdf(CONST, START, calendar.prev_trading_day(day)))
+    gate = regime.band_thresholds(ss.spot)[0] * ss.last_official_price / ss.spot[-1]
+    [(level, text)] = _previews(sent)
+    assert level == "INFO" and "目前 BULL" in text and "暫定維持 BULL" in text
+    assert f"< {gate:,.0f} 將轉 BEAR" in text
+
+    other = calendar.next_trading_day(day)                   # 非檢查日：不推
+    broker = setup_scenario(monkeypatch, today=other)
+    sent.clear()
+    assert run(broker, today=other) == 0
+    assert _previews(sent) == []
+
+
+def test_check_day_preview_flip_warns_without_trading(monkeypatch, t_plus_1):
+    """13:20 價已越過門檻 → WARNING；但 T+1 不變，今日仍照昨日訊號、不下單。"""
+    day = _check_day()
+    crash = lambda d: 40000.0 if d >= day else 46000.0       # noqa: E731
+    broker = setup_scenario(monkeypatch, today=day, price_fn=crash, equity=608_000.0)
+    sent = _capture(monkeypatch)
+    assert run(broker, today=day) == 0
+    [(level, text)] = _previews(sent)
+    assert level == "WARNING" and "暫定轉 BEAR" in text and "L=1" in text
+    assert broker.placed == []
+    st = state_mod.load()
+    assert st.exec_leverage == config.L_HIGH and st.preview["leverage"] == config.L_LOW
+    assert any("⚠️ 1 則警示" in t for _, t in sent)
+
+
+def test_check_day_from_bear_shows_upper_gate(monkeypatch, t_plus_1):
+    day = _check_day()
+    broker = setup_scenario(monkeypatch, today=day, price_fn=DROP_JULY,
+                            held_qty=2, state_lev=config.L_LOW)
+    sent = _capture(monkeypatch)
+    assert run(broker, today=day) == 0
+    [(level, text)] = _previews(sent)
+    assert level == "INFO" and "目前 BEAR" in text and "將轉 BULL" in text
+
+
+def test_check_day_without_today_row_skips_preview(monkeypatch, t_plus_1):
+    """結算後過渡期或即時價取不到：無今日列，仍告知今天是檢查日。"""
+    day = _check_day()
+    ss = build_signal_series(synth_cdf(CONST, START, calendar.prev_trading_day(day)))
+    lev, _ = regime.compute_regime(ss.spot)
+    sent = _capture(monkeypatch)
+    warnings: list[str] = []
+    main_mod._check_day_notice(ss, lev, len(ss.dates) - 1, day, warnings)
+    assert sent == [("INFO", "今日為訊號檢查日｜目前 BULL｜今日無暫定價，略過預覽（不影響今日執行）")]
+    assert warnings == []
+
+
+def test_check_day_notice_failure_never_breaks_batch(monkeypatch, t_plus_1):
+    def boom(*a, **k):
+        raise RuntimeError("preview broken")
+
+    day = _check_day()
+    broker = setup_scenario(monkeypatch, today=day)
+    monkeypatch.setattr(main_mod, "_check_day_notice", boom)
+    assert run(broker, today=day) == 0
+
+
+# ── 當天執行（每日 13:20 用即時價判定並執行）──────────────────────────────────
+
+CRASH_TODAY = lambda d: 40000.0 if d >= TODAY else 46000.0      # noqa: E731
+EQUITY = 608_000.0     # L=2 時 3 口、L=1 時 2 口：切換與否看得出來，且不觸發其他再平衡
+
+
+def test_same_day_signal_trades_at_1320(monkeypatch):
+    """今日 13:20 跌破下緣 → 當場減碼，不等下一交易日。"""
+    broker = setup_scenario(monkeypatch, price_fn=CRASH_TODAY, equity=EQUITY)
+    sent = _capture(monkeypatch)
+    assert run(broker) == 0
+    [h] = broker.placed
+    assert (h.action, h.quantity) == ("Sell", 1)
+    st = state_mod.load()
+    assert st.exec_leverage == config.L_LOW and st.regime == "BEAR"
+    assert st.official_leverage == config.L_HIGH        # 官方訊號到昨日仍是 BULL
+    assert any("regime 切換" in t for _, t in sent)
+
+
+def test_t_plus_1_mode_waits_for_next_day(monkeypatch, t_plus_1):
+    """回退模式：同一情境今日不動，證明兩種模式真的不同。"""
+    broker = setup_scenario(monkeypatch, price_fn=CRASH_TODAY, equity=EQUITY)
+    assert run(broker) == 0
+    assert broker.placed == []
+    assert state_mod.load().exec_leverage == config.L_HIGH
+
+
+def test_same_day_inside_band_does_not_trade(monkeypatch):
+    near = lambda d: 45900.0 if d >= TODAY else 46000.0         # noqa: E731
+    broker = setup_scenario(monkeypatch, price_fn=near, equity=EQUITY)
+    assert run(broker) == 0
+    assert broker.placed == []
+    assert state_mod.load().exec_leverage == config.L_HIGH
+
+
+def test_summary_shows_distance_to_gate(monkeypatch):
+    broker = setup_scenario(monkeypatch, equity=EQUITY)
+    sent = _capture(monkeypatch)
+    assert run(broker) == 0
+    [summary] = [t for _, t in sent if "摘要" in t]
+    assert "BEAR 門檻" in summary and "距 -" in summary
+
+
+def test_summary_after_flip_shows_gate_back(monkeypatch):
+    """切換當天要看轉回去的門檻，不是今天剛越過的那條（2026-11-06 實況）。"""
+    broker = setup_scenario(monkeypatch, price_fn=CRASH_TODAY, equity=EQUITY)
+    sent = _capture(monkeypatch)
+    assert run(broker) == 0
+    [summary] = [t for _, t in sent if "摘要" in t]
+    assert "BEAR L=1" in summary and "BEAR 門檻" not in summary
+    gate = float(re.search(r"BULL 門檻 ([\d,]+)（距 \+", summary).group(1).replace(",", ""))
+    # 今日列之前都是 46000，上緣解 p = 1.01 × (199 × 46000 + p) / 200
+    assert abs(gate - 1.01 * 199 * 46000 / (200 - 1.01)) < 1
+
+
+def test_summary_stays_on_actual_state_when_flip_blocked(monkeypatch):
+    """報價核對擋下切換：部位還是 BULL，摘要就還是 BEAR 門檻。"""
+    broker = setup_scenario(monkeypatch, price_fn=CRASH_TODAY, equity=EQUITY)
+    for code in [c for c in broker.quotes if c.startswith("TMF")]:
+        broker.quotes[code] = flat_quote(code, 46000.0)
+    sent = _capture(monkeypatch)
+    assert run(broker) == 0
+    [summary] = [t for _, t in sent if "摘要" in t]
+    assert "BEAR 門檻" in summary and "BULL 門檻" not in summary
+
+
+def test_summary_follows_actual_state_not_official(monkeypatch):
+    """昨日 13:20 判 BEAR、官方仍是 BULL，今日也在下緣之下：實際是 BEAR，看轉回去的門檻。"""
+    broker = setup_scenario(monkeypatch, price_fn=CRASH_TODAY, equity=800_000.0,
+                            held_qty=2, state_lev=config.L_LOW)
+    st = state_mod.load()
+    st.official_leverage = config.L_HIGH
+    state_mod.save(st)
+    sent = _capture(monkeypatch)
+    assert run(broker) == 0
+    assert state_mod.load().exec_leverage == config.L_LOW
+    [summary] = [t for _, t in sent if "摘要" in t]
+    assert "BULL 門檻" in summary and "BEAR 門檻" not in summary
+
+
+def test_wrong_1320_call_is_overridden_next_day(monkeypatch):
+    """昨日 13:20 判 BEAR、結算價卻沒跌破：今日由官方狀態重算，回到 BULL 並告警。"""
+    broker = setup_scenario(monkeypatch, equity=700_000.0, held_qty=2,
+                            state_lev=config.L_LOW)
+    st = state_mod.load()
+    st.official_leverage = config.L_HIGH
+    st.preview = {"date": st.signal_date, "leverage": config.L_LOW}
+    state_mod.save(st)
+    sent = _capture(monkeypatch)
+    assert run(broker) == 0
+    [h] = broker.placed
+    assert (h.action, h.quantity) == ("Buy", 1)
+    assert state_mod.load().exec_leverage == config.L_HIGH
+    assert any("與昨日 13:20 判定不一致" in t for _, t in sent)
+    assert not any("資料重建" in t for _, t in sent), "13:20 誤判不是資料修正"
+
+
+def test_no_today_price_keeps_actual_leverage(monkeypatch):
+    """沒有今日價：維持昨日實際槓桿，不跟著官方訊號買回。"""
+    broker = setup_scenario(monkeypatch, equity=700_000.0, held_qty=2,
+                            state_lev=config.L_LOW)
+    st = state_mod.load()
+    st.official_leverage = config.L_HIGH
+    state_mod.save(st)
+    for code in [c for c in broker.quotes if c.startswith("TXF")]:
+        del broker.quotes[code]
+    sent = _capture(monkeypatch)
+    assert run(broker) == 0
+    assert broker.placed == []
+    assert state_mod.load().exec_leverage == config.L_LOW
+    assert any(lv == "WARNING" and "維持昨日槓桿" in t for lv, t in sent)
+
+
+def test_flip_blocked_when_tx_and_tmf_disagree(monkeypatch):
+    """大台壞報價不得觸發切換：同月微台對不上 → ALERT、不下單。"""
+    broker = setup_scenario(monkeypatch, price_fn=CRASH_TODAY, equity=EQUITY)
+    for code in [c for c in broker.quotes if c.startswith("TMF")]:
+        broker.quotes[code] = flat_quote(code, 46000.0)
+    sent = _capture(monkeypatch)
+    assert run(broker) == 0
+    assert broker.placed == []
+    assert state_mod.load().exec_leverage == config.L_HIGH
+    assert any(lv == "ALERT" and "今日不切換" in t for lv, t in sent)
+    assert "flip_blocked" in _audit_events()
+    [check] = _audit_rows("flip_quote_check")
+    assert check["tmf"] == 46000.0 and check["gap"] > config.FLIP_QUOTE_TOL
+
+
+def test_flip_quote_check_recorded_when_passed(monkeypatch):
+    """通過也要留下比對值，事後才查得到當時兩邊差多少。"""
+    broker = setup_scenario(monkeypatch, price_fn=CRASH_TODAY, equity=EQUITY)
+    assert run(broker) == 0
+    assert "flip_blocked" not in _audit_events()
+    [check] = _audit_rows("flip_quote_check")
+    assert check["month"] and check["tx"] > 0 and check["tmf"] > 0
+    assert check["gap"] <= config.FLIP_QUOTE_TOL
+
+
+def test_no_flip_quote_check_without_a_flip(monkeypatch):
+    broker = setup_scenario(monkeypatch, equity=EQUITY)
+    assert run(broker) == 0
+    assert "flip_quote_check" not in _audit_events()
+
+
+def test_flip_blocked_when_tx_quote_is_stale(monkeypatch):
+    broker = setup_scenario(monkeypatch, price_fn=CRASH_TODAY, equity=EQUITY)
+    for code, q in broker.quotes.items():
+        q.ts = dt.datetime.combine(TODAY, dt.time(13, 19 if code.startswith("TMF") else 0))
+    _at(monkeypatch, "13:20")
+    sent = _capture(monkeypatch)
+    assert run_daily(broker, today=TODAY) == 0
+    assert broker.placed == []
+    assert any(lv == "ALERT" and "沒有更新" in t for lv, t in sent)
+
+
+def test_flip_blocked_when_cross_check_unavailable(monkeypatch):
+    """核對不了就不切換。"""
+    from d10_trading.execution.broker import BrokerError
+
+    broker = setup_scenario(monkeypatch, price_fn=CRASH_TODAY, equity=EQUITY)
+    real = broker.contract_by_month
+
+    def tx_only(product, month):
+        if product == config.PRODUCT:
+            raise BrokerError("查無此月份")
+        return real(product, month)
+
+    monkeypatch.setattr(broker, "contract_by_month", tx_only)
+    sent = _capture(monkeypatch)
+    assert run(broker) == 0
+    assert broker.placed == []
+    assert any(lv == "ALERT" and "無法取得" in t for lv, t in sent)
+
+
+# ── 口數遲滯帶（2026-11-24 新增）───────────────────────────────────────────────
+# 價格 46,000、乘數 10：BULL raw = E / 230,000；CRASH_TODAY 的 BEAR raw = E / 400,000。
+
+def test_band_holds_lots_within_regime(monkeypatch):
+    """同一 regime、raw 2.55：四捨五入要加到 3 口，但仍在帶內 → 不下單。"""
+    broker = setup_scenario(monkeypatch, equity=586_500.0, held_qty=2)
+    sent = _capture(monkeypatch)
+    assert run(broker) == 0
+    assert broker.placed == []
+    [dec] = _audit_rows("decision")
+    assert dec["band_hold"] is True and dec["target"] == 2
+    [summary] = [t for _, t in sent if "摘要" in t]
+    assert "無動作（遲滯帶：raw 2.55，維持 2 口）" in summary
+
+
+def test_band_zero_restores_plain_rounding(monkeypatch):
+    monkeypatch.setattr(config, "LOT_HYSTERESIS", 0.0)
+    broker = setup_scenario(monkeypatch, equity=586_500.0, held_qty=2)
+    assert run(broker) == 0
+    [h] = broker.placed
+    assert (h.action, h.quantity) == ("Buy", 1)
+    assert _audit_rows("decision")[0]["band_hold"] is False
+
+
+def test_band_crossed_trades(monkeypatch):
+    broker = setup_scenario(monkeypatch, equity=609_500.0, held_qty=2)   # raw 2.65
+    assert run(broker) == 0
+    [h] = broker.placed
+    assert (h.action, h.quantity) == ("Buy", 1)
+
+
+def test_switch_day_ignores_band(monkeypatch):
+    """轉 BEAR 當天 raw 1.45：帶寬會留住 2 口，但切換日照四捨五入減到 1 口。"""
+    broker = setup_scenario(monkeypatch, price_fn=CRASH_TODAY, equity=580_000.0,
+                            held_qty=2)
+    assert run(broker) == 0
+    [h] = broker.placed
+    assert (h.action, h.quantity) == ("Sell", 1)
+    st = state_mod.load()
+    assert st.exec_leverage == config.L_LOW and st.total_qty() == 1
+
+
+def test_fuse_ignores_band(monkeypatch):
+    """保險絲觸發（持 1 口、raw 0.45、實際槓桿 4.4）：帶寬會留住 1 口，保險絲照四捨五入減到 0。"""
+    broker = setup_scenario(monkeypatch, equity=103_500.0, held_qty=1)
+    assert run(broker) == 2
+    [h] = broker.placed
+    assert (h.action, h.quantity) == ("Sell", 1)
+    assert state_mod.load().total_qty() == 0
+
+
 # ── 臨時停市偵測（2026-10-23 颱風後新增）─────────────────────────────────────
 # 10/23 實況：假日檔沒有這天 → 批次照常執行、Telegram 只有一般摘要。若當天剛好
 # 需要交易，委託會送進休市的市場。13:20 先以近月最後成交時間確認今日真的在交易。
@@ -606,6 +915,13 @@ def _audit_events():
     if not p.exists():
         return []
     return [json.loads(x)["event"] for x in p.read_text(encoding="utf-8").splitlines()]
+
+
+def _audit_rows(event):
+    import json
+    p = config.LOG_DIR / "audit.jsonl"
+    rows = [json.loads(x) for x in p.read_text(encoding="utf-8").splitlines()]
+    return [r for r in rows if r["event"] == event]
 
 
 def test_closed_market_places_no_orders(monkeypatch):

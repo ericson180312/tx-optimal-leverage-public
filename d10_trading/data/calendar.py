@@ -125,6 +125,16 @@ def settlement_date(year: int, month: int) -> dt.date:
     return d
 
 
+def coverage_deadline() -> dt.date:
+    """假日檔實際可用的最後一天＝涵蓋末年 12 月合約的結算日。
+
+    🔴 不是 12/31：結算日隔天起近月換成次年 1 月合約，日批次推算它的結算日（互驗）
+    與 T−5 轉倉日都要用到次年的交易日，未涵蓋即 CalendarCoverageError、整天停擺
+    （2026-11-02 實測：12/16 結算、12/17 起中斷）。到期哨兵與自動更新都以此為期限。
+    """
+    return settlement_date(max(covered_years()), 12)
+
+
 def reload() -> None:
     """清除假日檔快取（holiday_sync 寫入後呼叫，使新資料立即生效）。"""
     _load_holiday_file.cache_clear()

@@ -28,6 +28,22 @@ def test_coverage_error_for_unknown_year():
         calendar.is_trading_day(dt.date(2031, 1, 6))
 
 
+def test_coverage_deadline_is_last_day_batch_can_run(temp_holiday_file):
+    """期限＝12 月結算日：當天近月仍是 12 月合約、算得出來；隔天換成次年 1 月合約，
+    日批次的結算日互驗與 T−5 轉倉日都要次年資料 → 中斷（2026-11-02 實測的真實中斷點）。"""
+    from d10_trading.strategy.rollover import decide_roll
+
+    deadline = calendar.coverage_deadline()
+    assert deadline == dt.date(2026, 12, 16)
+    assert calendar.settlement_date(2026, 12) == deadline           # 當天：近月 202612
+    decide_roll(deadline, deadline, 100.0, True)                    # 不拋出
+    jan = calendar.third_wednesday(2027, 1)                         # 隔天：近月 202701
+    with pytest.raises(CalendarCoverageError):
+        calendar.settlement_date(2027, 1)
+    with pytest.raises(CalendarCoverageError):
+        decide_roll(deadline + dt.timedelta(days=1), jan, 100.0, True)
+
+
 def test_third_wednesday_matches_backtest_formula():
     """與回測 continuous.third_wednesday 同式（合約字串 YYYYMM）。"""
     from backtest_threshold import continuous as bt

@@ -41,9 +41,17 @@ def signal_series():
 def test_golden_bitwise_vs_round3_code(signal_series):
     """live 訊號 = backtest_multimarket 訊號，逐位元。"""
     import backtest_multimarket.signals as r3sg
-    ours = regime.trend_leverage(signal_series.spot)
+    ours = regime.trend_leverage(signal_series.spot, check_every=5)
     ref = r3sg.trend_leverage(signal_series.spot, config.L_LOW)
     assert np.array_equal(ours, ref), "live 與 backtest_multimarket 訊號不一致"
+
+
+def test_golden_daily_check_bitwise(signal_series):
+    """現行實盤規則（每日檢查）也與第三輪程式逐位元相同，只差 check_every 參數。"""
+    import backtest_multimarket.signals as r3sg
+    ours = regime.trend_leverage(signal_series.spot, check_every=1)
+    ref = r3sg.trend_leverage(signal_series.spot, config.L_LOW, check_every=1)
+    assert np.array_equal(ours, ref), "每日檢查訊號與 backtest_multimarket 不一致"
 
 
 def test_golden_switch_dates_vs_backtest_csv(signal_series):
@@ -54,7 +62,7 @@ def test_golden_switch_dates_vs_backtest_csv(signal_series):
     csv_exec = np.where(csv["lev_D_10"].to_numpy() >= 1.5,
                         config.L_HIGH, config.L_LOW)
 
-    lev = regime.trend_leverage(signal_series.spot)
+    lev = regime.trend_leverage(signal_series.spot, check_every=5)
     # T+1：執行槓桿 = 訊號 shift 一日（首日沿用首值，與回測 to_exec 相同）
     exec_lev = np.concatenate([lev[:1], lev[:-1]])
     pos = {d: i for i, d in enumerate(signal_series.dates)}

@@ -13,6 +13,7 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import logging
+import math
 import sys
 import time
 from zoneinfo import ZoneInfo
@@ -200,30 +201,33 @@ def _run_core(broker: BrokerInterface, st, today, now, dry_run, ignore_window,
             notify.send("WARNING", msg)
 
         lev, _ = regime.compute_regime(ss.spot)
-        exec_idx = ss.exec_index(today)          # T+1：嚴格早於今日的最後官方列
-        sig_date = ss.dates[exec_idx]
+        official_idx = ss.exec_index(today)      # 嚴格早於今日的最後官方列
+        sig_date = ss.dates[official_idx]
         prev_td = calendar.prev_trading_day(today)
         if sig_date != prev_td:
-            raise DayStop(f"執行訊號日 {sig_date} ≠ 上一交易日 {prev_td}"
+            raise DayStop(f"最後官方列 {sig_date} ≠ 上一交易日 {prev_td}"
                           "（序列缺日或行事曆不符），拒絕下單")
-        l_exec = float(lev[exec_idx])
-        cur_regime = regime.BULL if l_exec == config.L_HIGH else regime.BEAR
+        official_lev = float(lev[official_idx])
         t_idx = ss.today_index(today)
         preview = float(lev[t_idx]) if t_idx is not None else None
+        l_exec = _today_leverage(broker, ss, st, official_lev, preview, now, warnings)
+        cur_regime = regime.BULL if l_exec == config.L_HIGH else regime.BEAR
 
-        # 訊號一致性檢查：昨日預覽 vs 今日官方定案；歷史訊號重算漂移
+        # 訊號一致性檢查：昨日 13:20 判定 vs 官方定案；歷史訊號重算漂移
         if st.preview and st.preview.get("date") == sig_date.isoformat() \
-                and st.preview.get("leverage") not in (None, l_exec):
-            msg = (f"訊號定案與昨日預覽不一致：預覽 {st.preview['leverage']} → "
-                   f"定案 {l_exec}（官方結算價跨過緩衝帶邊界，屬正常現象）")
+                and st.preview.get("leverage") not in (None, official_lev):
+            msg = (f"訊號定案與昨日 13:20 判定不一致：13:20 {st.preview['leverage']} → "
+                   f"定案 {official_lev}（官方結算價跨過緩衝帶邊界，屬正常現象）")
             warnings.append(msg)
             notify.send("WARNING", msg)
-        if st.signal_date and st.exec_leverage is not None:
+        prev_official = (st.official_leverage if st.official_leverage is not None
+                         else st.exec_leverage)
+        if st.signal_date and prev_official is not None:
             try:
                 idx = ss.dates.index(dt.date.fromisoformat(st.signal_date))
-                if float(lev[idx]) != float(st.exec_leverage):
+                if float(lev[idx]) != float(prev_official):
                     msg = (f"資料重建後 {st.signal_date} 的訊號由 "
-                           f"{st.exec_leverage} 變為 {lev[idx]}（資料修正）")
+                           f"{prev_official} 變為 {lev[idx]}（資料修正）")
                     warnings.append(msg)
                     notify.send("WARNING", msg)
             except ValueError:
@@ -231,6 +235,11 @@ def _run_core(broker: BrokerInterface, st, today, now, dry_run, ignore_window,
         if st.exec_leverage is not None and l_exec != st.exec_leverage:
             notify.send("INFO", f"regime 切換：今日執行槓桿 {st.exec_leverage} → "
                                 f"{l_exec}（{cur_regime}）")
+
+        try:
+            _check_day_notice(ss, lev, official_idx, today, warnings)
+        except Exception as e:  # noqa: BLE001 - 預覽通知故障不得影響交易
+            log.warning("檢查日預覽失敗（忽略）：%s", type(e).__name__)
 
         # ── 補寫前日「執行價 vs 官方結算價」稽核 ───────────────────────────
         _flush_exec_audit(st, ss)
@@ -264,7 +273,13 @@ def _run_core(broker: BrokerInterface, st, today, now, dry_run, ignore_window,
             target_c = broker.contract_by_month(config.PRODUCT, held_month)
             target_q_obj = broker.quote(held_code)
 
-        sz = sizing.target_contracts(l_exec, recon.equity, target_q_obj.price)
+        # 遲滯帶只抑制同一 regime 內的邊界來回。切換日（目標槓桿倍增或減半）、空手、
+        # 保險絲觸發時照純四捨五入重新決定，避免該減碼時被帶寬留住。
+        same_regime = (st.exec_leverage is not None and l_exec == st.exec_leverage
+                       and not fuse_mode)
+        sz = sizing.target_contracts(l_exec, recon.equity, target_q_obj.price,
+                                     held=held_qty if same_regime else None,
+                                     band=config.LOT_HYSTERESIS)
         delta = sz.target_contracts - held_qty
         try:
             sizing.check_caps(sz.target_contracts, delta)
@@ -272,22 +287,28 @@ def _run_core(broker: BrokerInterface, st, today, now, dry_run, ignore_window,
             raise DayStop(f"口數防呆：{e}") from e
         _check_capacity(recon.equity, target_q_obj.price, today, warnings)
 
-        log.info("訊號 %s（L_exec=%.1f，訊號日 %s）；權益 %.0f、目標 %d 口"
+        log.info("訊號 %s（L_exec=%.1f，官方資料至 %s）；權益 %.0f、目標 %d 口"
                  "（raw=%.2f、殘餘 %.2f）、現有 %d 口；月差 %.0f%s",
                  cur_regime, l_exec, sig_date, recon.equity,
                  sz.target_contracts, sz.raw_contracts, sz.rounding_residual,
                  held_qty, spread,
                  f"；轉倉（{roll.reason}）" if roll.should_roll else "")
+        if sz.band_hold:
+            log.info("口數遲滯：raw=%.3f 四捨五入為 %d 口，仍在帶內（±%.1f），維持 %d 口",
+                     sz.raw_contracts, math.floor(sz.raw_contracts + 0.5),
+                     0.5 + config.LOT_HYSTERESIS, held_qty)
         audit("decision", regime=cur_regime, exec_leverage=l_exec,
+              official_leverage=official_lev,
               signal_date=sig_date.isoformat(), equity=round(recon.equity),
               price=target_q_obj.price, target=sz.target_contracts,
               raw_contracts=round(sz.raw_contracts, 4), held=held_qty,
               delta=delta, roll=roll.reason if roll.should_roll else "",
               spread=round(spread, 1), preview=preview,
-              target_code=target_c.code)
+              target_code=target_c.code, band_hold=sz.band_hold)
 
         # ── 5. 下單執行 ────────────────────────────────────────────────────
-        action_desc = "無動作"
+        action_desc = (f"無動作（遲滯帶：raw {sz.raw_contracts:.2f}，維持 {held_qty} 口）"
+                       if sz.band_hold else "無動作")
         rep = orders.ExecutionReport(ok=True)
         need_trade = roll.should_roll or delta != 0
         if need_trade:
@@ -354,6 +375,7 @@ def _run_core(broker: BrokerInterface, st, today, now, dry_run, ignore_window,
         st.regime = cur_regime
         st.exec_leverage = l_exec
         st.signal_date = sig_date.isoformat()
+        st.official_leverage = official_lev
         st.preview = ({"date": today.isoformat(), "leverage": preview}
                       if preview is not None else None)
         st.equity = recon.equity
@@ -380,6 +402,7 @@ def _run_core(broker: BrokerInterface, st, today, now, dry_run, ignore_window,
                     f"{today} 摘要｜{cur_regime} L={l_exec:g}｜權益 "
                     f"{recon.equity:,.0f}｜{held_qty}→{held_after} 口"
                     f"（目標 {sz.target_contracts}）｜{action_desc}"
+                    + _gate_summary(ss, lev, official_idx, l_exec)
                     + (f"｜⚠️ {len(warnings)} 則警示" if warnings else ""))
         exit_code = (1 if (need_trade and not dry_run and not rep.ok)
                      else 2 if fuse_mode else 0)
@@ -605,6 +628,132 @@ def _market_closed_reason(broker: BrokerInterface, today: dt.date,
         return (f"近月 {front.code} 已 {idle:.0f} 分鐘沒有成交（最後成交 {last:%H:%M}）"
                 "——疑似盤中停市或報價中斷")
     return None
+
+
+def _today_leverage(broker, ss, st, official: float, preview: float | None,
+                    now: dt.datetime, warnings: list[str]) -> float:
+    """今日執行槓桿。
+
+    T+1：上一官方訊號。當天執行：昨日狀態一律由官方序列重算，再以今日 13:20 價判定，
+    所以 13:20 的誤判隔天就被結算價覆蓋，不會卡在錯誤狀態，也不依賴狀態檔。
+    判定不了（無今日價、報價核對不過）時維持昨日實際槓桿：不確定就不動。
+    """
+    if config.T_PLUS_1:
+        return official
+    held = st.exec_leverage if st.exec_leverage is not None else official
+    if preview is None:
+        msg = f"今日無暫定價，無法判定今日訊號——維持昨日槓桿 L={held:g}"
+        warnings.append(msg)
+        notify.send("WARNING", msg)
+        return held
+    if preview == held:
+        return preview
+    why = _flip_quote_problem(broker, ss, now)
+    if why is None:
+        return preview
+    audit("flip_blocked", held=held, signal=preview, reason=why)
+    msg = f"訊號要求 L={held:g} → {preview:g}，但{why}——今日不切換，維持 L={held:g}"
+    warnings.append(msg)
+    notify.send("ALERT", msg)
+    return held
+
+
+def _flip_quote_problem(broker, ss, now: dt.datetime) -> str | None:
+    """切換會下單，而當天訊號只靠一筆即時價：先和同月微台核對，並確認報價新鮮。"""
+    month = ss.today_contract or ss.held_contract
+    try:
+        tx = broker.quote(broker.contract_by_month(config.SIGNAL_PRODUCT, month).code)
+        tm = broker.quote(broker.contract_by_month(config.PRODUCT, month).code)
+    except Exception as e:  # noqa: BLE001 - 核對不了就不切換
+        return f"無法取得 {month} 報價核對（{type(e).__name__}）"
+    if tx.price <= 0 or tm.price <= 0:
+        return f"{month} 報價異常（大台 {tx.price:g}、微台 {tm.price:g}）"
+    gap = abs(tm.price / tx.price - 1.0)
+    idle = None if tx.ts is None else (now.replace(tzinfo=None) - tx.ts).total_seconds() / 60.0
+    audit("flip_quote_check", month=month, tx=tx.price, tmf=tm.price, gap=round(gap, 6),
+          tx_idle_min=None if idle is None else round(idle, 1))
+    if gap > config.FLIP_QUOTE_TOL:
+        return f"大台 {tx.price:,.0f} 與微台 {tm.price:,.0f} 相差 {gap:.2%}"
+    if idle is not None and idle > config.MARKET_STALE_MINUTES:
+        return f"大台報價已 {idle:.0f} 分鐘沒有更新"
+    return None
+
+
+def _signal_gate(ss, lev, official_idx: int, *, bull: bool | None = None) -> dict | None:
+    """切換門檻，換算成今日列所用合約的價位；無今日列回 None。
+
+    bull 指定從哪個狀態看，省略時用上一官方狀態，也就是今日判定實際比對的門檻。
+    """
+    t = official_idx + 1
+    if t >= len(ss.dates):
+        return None
+    if bull is None:
+        bull = lev[official_idx] == config.L_HIGH
+    if ss.has_provisional:
+        k = ss.today_base / ss.spot[t - 1]
+        contract = ss.today_contract
+    else:
+        k = ss.last_official_price / ss.spot[ss.n_official - 1]
+        contract = ss.held_contract
+    lower, upper = regime.band_thresholds(ss.spot[:t])
+    return {"bull": bull, "to": regime.BEAR if bull else regime.BULL,
+            "gate": (lower if bull else upper) * k, "price": ss.spot[t] * k,
+            "contract": contract}
+
+
+def _gate_summary(ss, lev, official_idx: int, l_exec: float) -> str:
+    """當天執行時每日都是檢查日：把距切換門檻多遠併入摘要，不另發通知。
+
+    從今日實際狀態看：切換當天已是新狀態，該看的是轉回去的門檻，不是今天剛越過的那條。
+    數字用今日窗口，下一交易日窗口移一天，會略有出入。
+    """
+    if config.T_PLUS_1:
+        return ""
+    try:
+        g = _signal_gate(ss, lev, official_idx, bull=l_exec == config.L_HIGH)
+    except Exception as e:  # noqa: BLE001 - 顯示用，不得影響批次
+        log.warning("門檻計算失敗（忽略）：%s", type(e).__name__)
+        return ""
+    if g is None:
+        return ""
+    return (f"｜TX {g['contract']} {g['price']:,.0f}，{g['to']} 門檻 {g['gate']:,.0f}"
+            f"（距 {g['gate'] / g['price'] - 1:+.1%}）")
+
+
+def _check_day_notice(ss, lev, official_idx: int, today: dt.date,
+                      warnings: list[str]) -> None:
+    """T+1 模式的檢查日推播：今日結算價到哪裡會切換 regime，以及 13:20 的暫定結果。
+
+    結算價 13:45 後才有，批次此時已結束，切換要到下一交易日 13:20 執行才會通知；
+    檢查日落在週五時，整個週末都沒有提示。當天執行時切換當場就通知，不需要這則。
+    """
+    t = official_idx + 1                   # 訊號日已驗證為上一交易日，今日即下一列
+    if (not config.T_PLUS_1 or t < config.MA_WINDOW - 1
+            or t % config.SIGNAL_CHECK_EVERY != 0):
+        return
+    bull = lev[official_idx] == config.L_HIGH
+    cur, to = (regime.BULL, regime.BEAR) if bull else (regime.BEAR, regime.BULL)
+    head = f"今日為訊號檢查日｜目前 {cur}"
+    g = _signal_gate(ss, lev, official_idx)
+    if g is None:                          # 即時價取不到：無今日列
+        audit("check_day_preview", regime=cur, preview=None)
+        notify.send("INFO", f"{head}｜今日無暫定價，略過預覽（不影響今日執行）")
+        return
+
+    gate, now_px = g["gate"], g["price"]
+    flips = lev[t] != lev[official_idx]
+    audit("check_day_preview", regime=cur, preview=float(lev[t]),
+          contract=g["contract"], price=round(now_px, 1), gate=round(gate, 1))
+    quote = f"TX {g['contract']} 現價 {now_px:,.0f}"
+    if flips:
+        msg = (f"{head}｜{quote} 已越過門檻 {gate:,.0f}，暫定轉 {to}｜"
+               f"以今日結算價定案，成立則下一交易日 13:20 改為 L={float(lev[t]):g}")
+        warnings.append(msg)
+        notify.send("WARNING", msg)
+    else:
+        side = "<" if bull else ">"
+        notify.send("INFO", f"{head}｜{quote}｜今日結算價 {side} {gate:,.0f} 將轉 {to}"
+                            f"（距 {gate / now_px - 1:+.1%}）｜暫定維持 {cur}")
 
 
 def _check_ca(broker: BrokerInterface) -> None:

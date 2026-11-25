@@ -4,7 +4,7 @@
 regime 切換日期必須與回測輸出完全一致。因此：
 - 數值運算順序（cumsum 建 MA、比較式）與 backtest_multimarket 完全相同，不得「等價改寫」。
 - 檢查日規則 = 序列索引 t % SIGNAL_CHECK_EVERY == 0（t 自序列首日起算），
-  非固定星期幾（見 config.SIGNAL_CHECK_EVERY 的口徑說明）。
+  非固定星期幾（見 config.SIGNAL_CHECK_EVERY 的口徑說明）。實盤現為每日檢查。
 - MA 可得前（前 199 日）預設 BULL（=滿載），與回測一致。
 """
 from __future__ import annotations
@@ -21,13 +21,15 @@ BULL, BEAR = "BULL", "BEAR"
 def trend_leverage(spot: np.ndarray, l_low: float = config.L_LOW, *,
                    ma_win: int = config.MA_WINDOW,
                    buf: float = config.BUFFER,
-                   check_every: int = config.SIGNAL_CHECK_EVERY,
+                   check_every: int | None = None,
                    l_high: float = config.L_HIGH) -> np.ndarray:
-    """spot > 200MA(±1% 緩衝) → L_high，否則 L_low；每 5 個序列日檢查一次。
+    """spot > 200MA(±1% 緩衝) → L_high，否則 L_low；每 check_every 個序列日檢查一次。
 
     緩衝帶遲滯：on→off 需收盤 < MA×(1−buf)；off→on 需 > MA×(1+buf)；帶內維持。
     實作與 backtest_multimarket.signals.trend_leverage 的 1D 路徑逐位元相同。
+    check_every 省略時取 config.SIGNAL_CHECK_EVERY。
     """
+    check_every = check_every or config.SIGNAL_CHECK_EVERY
     s = np.asarray(spot, dtype=float)[:, None]
     T, P = s.shape
     csum = np.vstack([np.zeros((1, P)), np.cumsum(s, axis=0)])
@@ -46,6 +48,19 @@ def compute_regime(spot: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     """回傳 (訊號槓桿陣列, regime 布林陣列 True=BULL)。"""
     lev = trend_leverage(spot)
     return lev, lev == config.L_HIGH
+
+
+def band_thresholds(spot_before: np.ndarray, *, ma_win: int = config.MA_WINDOW,
+                    buf: float = config.BUFFER) -> tuple[float, float]:
+    """檢查日當天 spot 的切換門檻 (下緣, 上緣)；spot_before 為今日之前的序列。
+
+    今日值本身也計入 MA，不能直接用昨日的 MA×(1∓buf)：門檻解自
+    s < (1−buf)·(S + s)/N（S＝今日之前 N−1 列總和），上緣同理。
+    僅供通知顯示；訊號一律由 trend_leverage 決定，它不依賴本函式。
+    """
+    past = float(np.sum(spot_before[-(ma_win - 1):]))
+    return ((1.0 - buf) * past / (ma_win - (1.0 - buf)),
+            (1.0 + buf) * past / (ma_win - (1.0 + buf)))
 
 
 def regime_switches(dates: list[dt.date],

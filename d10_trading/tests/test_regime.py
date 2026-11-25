@@ -13,6 +13,20 @@ def lev(spot, **kw):
     return regime.trend_leverage(np.asarray(spot, float), **kw)
 
 
+def test_band_thresholds_match_state_machine():
+    """預覽門檻與狀態機在邊界兩側一致（今日值也計入 MA；t=405 為檢查日）。"""
+    up = 100.0 * 1.001 ** np.arange(405)
+    lo, _ = regime.band_thresholds(up)
+    assert lev(np.append(up, lo * (1 - 1e-6)))[-1] == config.L_LOW
+    assert lev(np.append(up, lo * (1 + 1e-6)))[-1] == config.L_HIGH
+
+    down = 100.0 * 0.999 ** np.arange(405)
+    assert lev(down)[-1] == config.L_LOW                     # 前提：今日之前為 BEAR
+    _, hi = regime.band_thresholds(down)
+    assert lev(np.append(down, hi * (1 + 1e-6)))[-1] == config.L_HIGH
+    assert lev(np.append(down, hi * (1 - 1e-6)))[-1] == config.L_LOW
+
+
 def test_warmup_defaults_to_bull():
     out = lev([100.0] * 50)                    # 不足 200 日：恆為 L_HIGH
     assert (out == config.L_HIGH).all()
@@ -51,13 +65,28 @@ def test_check_every_5_gates_switches():
     n = 210
     spot = np.full(n, 100.0)
     spot[203:] = 90.0                           # 自 t=203 起跌破（203 非 5 倍數）
-    out = lev(spot)
+    out = lev(spot, check_every=5)
     assert out[203] == config.L_HIGH
     assert out[204] == config.L_HIGH
     assert out[205] == config.L_LOW             # 205 = 下一個檢查日
     # 檢查日集合 = 索引 % 5 == 0（且 t ≥ 199）
     switches = np.nonzero(np.diff(out))[0] + 1
-    assert all(t % config.SIGNAL_CHECK_EVERY == 0 for t in switches)
+    assert all(t % 5 == 0 for t in switches)
+
+
+def test_daily_check_switches_on_the_day():
+    """每日檢查：跌破當天就切換，不等第 5 日。"""
+    spot = np.full(210, 100.0)
+    spot[203:] = 90.0
+    out = lev(spot, check_every=1)
+    assert out[202] == config.L_HIGH and out[203] == config.L_LOW
+
+
+def test_default_check_every_follows_config(t_plus_1):
+    """省略 check_every 時取呼叫當下的 config：回退只需改常數，不會被預設參數綁死。"""
+    spot = np.full(210, 100.0)
+    spot[203:] = 90.0
+    assert lev(spot)[203] == config.L_HIGH and lev(spot)[205] == config.L_LOW
 
 
 def test_regime_switches_dates():
@@ -73,6 +102,7 @@ def test_identical_to_round3_reference_formula():
     import backtest_multimarket.signals as r3sg
     rng = np.random.default_rng(7)
     spot = 8000.0 * np.cumprod(1.0 + rng.normal(0.0002, 0.015, size=1500))
-    ours = regime.trend_leverage(spot)
-    ref = r3sg.trend_leverage(spot, config.L_LOW)
-    assert np.array_equal(ours, ref)
+    for k in (5, 1):                            # 第三輪規則與現行實盤規則
+        ours = regime.trend_leverage(spot, check_every=k)
+        ref = r3sg.trend_leverage(spot, config.L_LOW, check_every=k)
+        assert np.array_equal(ours, ref), f"check_every={k}"

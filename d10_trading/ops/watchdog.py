@@ -4,7 +4,8 @@
 1. **假日檔涵蓋年份**——自 `data_static/taifex_holidays.csv` 的 covered_years
    自動推導，無需人工登錄。這是唯一「到期即 fail-closed、系統完全不跑」的
    項目（calendar.CalendarCoverageError），故最需要提前預警。
-   期限視為涵蓋末年的 12/31；跨年後首個交易日就會中斷。
+   期限是涵蓋末年 **12 月合約的結算日**（calendar.coverage_deadline），不是 12/31：
+   隔天起近月換成次年 1 月合約，推算其結算日與轉倉日就需要次年資料。
 2. **config.EXPIRY_DATES**——人工登錄的外部到期（CA 憑證、API 金鑰、信用卡）。
    這些到期時系統多半是「靜默失效」（下單被拒、主機被停），不會自我察覺。
 
@@ -56,12 +57,11 @@ def _level(days_left: int) -> str | None:
 
 
 def holiday_deadline() -> dt.date | None:
-    """假日檔的有效期限＝涵蓋末年的 12/31；讀不到檔案回 None。"""
+    """假日檔的有效期限＝涵蓋末年 12 月合約的結算日；讀不到檔案回 None。"""
     try:
-        years = calendar.covered_years()
+        return calendar.coverage_deadline()
     except Exception:  # noqa: BLE001 - 哨兵故障不得影響交易
         return None
-    return dt.date(max(years), 12, 31) if years else None
 
 
 def check_expiries(today: dt.date) -> list[ExpiryItem]:
@@ -73,11 +73,13 @@ def check_expiries(today: dt.date) -> list[ExpiryItem]:
         days = (deadline - today).days
         lv = _level(days)
         if lv:
+            nxt = deadline.year + 1
             items.append(ExpiryItem(
                 HOLIDAY_ITEM, deadline, days, lv,
-                note=(f"請依 TAIFEX 公告更新 {config.HOLIDAY_FILE.name} 的 "
-                      f"{deadline.year + 1} 年假日與 covered_years，"
-                      "否則次年首個交易日起程式將 fail-closed 完全不執行")))
+                note=(f"該日為 12 月合約結算日，隔天起近月換成 {nxt}01，需要 {nxt} 年假日"
+                      "推算結算日與轉倉日，未補入程式將 fail-closed 完全不執行。"
+                      "每日批次會自動向 TWSE 查詢、公告後自動補入；截止前仍未補入，"
+                      f"請依 TAIFEX 公告手動更新 {config.HOLIDAY_FILE.name}")))
 
     for name, deadline in config.EXPIRY_DATES.items():
         days = (deadline - today).days

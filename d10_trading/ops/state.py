@@ -1,9 +1,10 @@
 """狀態檔（JSON，原子寫入）：程式重啟必須無損恢復（規格 §7）。
 
 欄位：
-  regime / exec_leverage      最近一次「已定案」訊號（上一官方訊號日）
-  signal_date                 該訊號對應的官方資料日
-  preview                     今日暫定訊號（明日以官方收盤定案）{date, leverage}
+  regime / exec_leverage      最近一次批次實際採用的 regime 與槓桿
+  signal_date                 最近一筆官方資料日
+  official_leverage           該官方資料日的訊號槓桿（比對資料重建是否改變歷史訊號）
+  preview                     今日 13:20 價算出的訊號（次日與官方定案比對）{date, leverage}
   executed_date               本日已執行旗標（冪等性 🔴 的第一道防線）
   positions                   持倉明細 [{code, month, qty, avg_price}]（僅多單）
   equity                      最近一次查得的權益數
@@ -33,6 +34,7 @@ class State:
     regime: str | None = None
     exec_leverage: float | None = None
     signal_date: str | None = None
+    official_leverage: float | None = None
     preview: dict | None = None          # {"date": ..., "leverage": ...}
     executed_date: str | None = None
     positions: list[PositionState] = field(default_factory=list)

@@ -177,7 +177,7 @@ def auto_sync_if_needed(today: dt.date) -> SyncResult:
         return SyncResult("failed", detail="假日檔無 covered_years")
 
     last = max(covered)
-    deadline = dt.date(last, 12, 31)
+    deadline = calendar.coverage_deadline()       # 12 月結算日，不是 12/31
     if (deadline - today).days > config.EXPIRY_WARN_DAYS:
         return SyncResult("not_needed")           # 尚未進入預警窗
 
