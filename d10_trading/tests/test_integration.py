@@ -841,6 +841,57 @@ def test_flip_blocked_when_cross_check_unavailable(monkeypatch):
     assert any(lv == "ALERT" and "無法取得" in t for lv, t in sent)
 
 
+# ── 口數遲滯帶（2026-11-24 新增）───────────────────────────────────────────────
+# 價格 46,000、乘數 10：BULL raw = E / 230,000；CRASH_TODAY 的 BEAR raw = E / 400,000。
+
+def test_band_holds_lots_within_regime(monkeypatch):
+    """同一 regime、raw 2.55：四捨五入要加到 3 口，但仍在帶內 → 不下單。"""
+    broker = setup_scenario(monkeypatch, equity=586_500.0, held_qty=2)
+    sent = _capture(monkeypatch)
+    assert run(broker) == 0
+    assert broker.placed == []
+    [dec] = _audit_rows("decision")
+    assert dec["band_hold"] is True and dec["target"] == 2
+    [summary] = [t for _, t in sent if "摘要" in t]
+    assert "無動作（遲滯帶：raw 2.55，維持 2 口）" in summary
+
+
+def test_band_zero_restores_plain_rounding(monkeypatch):
+    monkeypatch.setattr(config, "LOT_HYSTERESIS", 0.0)
+    broker = setup_scenario(monkeypatch, equity=586_500.0, held_qty=2)
+    assert run(broker) == 0
+    [h] = broker.placed
+    assert (h.action, h.quantity) == ("Buy", 1)
+    assert _audit_rows("decision")[0]["band_hold"] is False
+
+
+def test_band_crossed_trades(monkeypatch):
+    broker = setup_scenario(monkeypatch, equity=609_500.0, held_qty=2)   # raw 2.65
+    assert run(broker) == 0
+    [h] = broker.placed
+    assert (h.action, h.quantity) == ("Buy", 1)
+
+
+def test_switch_day_ignores_band(monkeypatch):
+    """轉 BEAR 當天 raw 1.45：帶寬會留住 2 口，但切換日照四捨五入減到 1 口。"""
+    broker = setup_scenario(monkeypatch, price_fn=CRASH_TODAY, equity=580_000.0,
+                            held_qty=2)
+    assert run(broker) == 0
+    [h] = broker.placed
+    assert (h.action, h.quantity) == ("Sell", 1)
+    st = state_mod.load()
+    assert st.exec_leverage == config.L_LOW and st.total_qty() == 1
+
+
+def test_fuse_ignores_band(monkeypatch):
+    """保險絲觸發（持 1 口、raw 0.45、實際槓桿 4.4）：帶寬會留住 1 口，保險絲照四捨五入減到 0。"""
+    broker = setup_scenario(monkeypatch, equity=103_500.0, held_qty=1)
+    assert run(broker) == 2
+    [h] = broker.placed
+    assert (h.action, h.quantity) == ("Sell", 1)
+    assert state_mod.load().total_qty() == 0
+
+
 # ── 臨時停市偵測（2026-10-23 颱風後新增）─────────────────────────────────────
 # 10/23 實況：假日檔沒有這天 → 批次照常執行、Telegram 只有一般摘要。若當天剛好
 # 需要交易，委託會送進休市的市場。13:20 先以近月最後成交時間確認今日真的在交易。

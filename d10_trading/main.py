@@ -13,6 +13,7 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import logging
+import math
 import sys
 import time
 from zoneinfo import ZoneInfo
@@ -272,7 +273,13 @@ def _run_core(broker: BrokerInterface, st, today, now, dry_run, ignore_window,
             target_c = broker.contract_by_month(config.PRODUCT, held_month)
             target_q_obj = broker.quote(held_code)
 
-        sz = sizing.target_contracts(l_exec, recon.equity, target_q_obj.price)
+        # 遲滯帶只抑制同一 regime 內的邊界來回。切換日（目標槓桿倍增或減半）、空手、
+        # 保險絲觸發時照純四捨五入重新決定，避免該減碼時被帶寬留住。
+        same_regime = (st.exec_leverage is not None and l_exec == st.exec_leverage
+                       and not fuse_mode)
+        sz = sizing.target_contracts(l_exec, recon.equity, target_q_obj.price,
+                                     held=held_qty if same_regime else None,
+                                     band=config.LOT_HYSTERESIS)
         delta = sz.target_contracts - held_qty
         try:
             sizing.check_caps(sz.target_contracts, delta)
@@ -286,6 +293,10 @@ def _run_core(broker: BrokerInterface, st, today, now, dry_run, ignore_window,
                  sz.target_contracts, sz.raw_contracts, sz.rounding_residual,
                  held_qty, spread,
                  f"；轉倉（{roll.reason}）" if roll.should_roll else "")
+        if sz.band_hold:
+            log.info("口數遲滯：raw=%.3f 四捨五入為 %d 口，仍在帶內（±%.1f），維持 %d 口",
+                     sz.raw_contracts, math.floor(sz.raw_contracts + 0.5),
+                     0.5 + config.LOT_HYSTERESIS, held_qty)
         audit("decision", regime=cur_regime, exec_leverage=l_exec,
               official_leverage=official_lev,
               signal_date=sig_date.isoformat(), equity=round(recon.equity),
@@ -293,10 +304,11 @@ def _run_core(broker: BrokerInterface, st, today, now, dry_run, ignore_window,
               raw_contracts=round(sz.raw_contracts, 4), held=held_qty,
               delta=delta, roll=roll.reason if roll.should_roll else "",
               spread=round(spread, 1), preview=preview,
-              target_code=target_c.code)
+              target_code=target_c.code, band_hold=sz.band_hold)
 
         # ── 5. 下單執行 ────────────────────────────────────────────────────
-        action_desc = "無動作"
+        action_desc = (f"無動作（遲滯帶：raw {sz.raw_contracts:.2f}，維持 {held_qty} 口）"
+                       if sz.band_hold else "無動作")
         rep = orders.ExecutionReport(ok=True)
         need_trade = roll.should_roll or delta != 0
         if need_trade:

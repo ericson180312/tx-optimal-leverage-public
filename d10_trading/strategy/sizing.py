@@ -1,4 +1,8 @@
-"""口數計算（規格 §4）：整數口數天然構成 deadband，不另設參數。"""
+"""口數計算（規格 §4）：整數口數四捨五入，同一 regime 內另加遲滯帶。
+
+原設計認為整數口數天然構成 deadband，這只在遠離 N ± 0.5 時成立：raw 貼著邊界時，
+價格每穿越一次就加減一口；BEAR（L=1）單向下跌更會隔日加減（README §2.2）。
+"""
 from __future__ import annotations
 
 import math
@@ -20,25 +24,38 @@ class SizingResult:
     target_contracts: int
     rounding_residual: float      # raw − target（捨入方向與殘餘偏差，落日誌）
     achieved_leverage: float      # target×價格×乘數 / E（實際落點槓桿）
+    band_hold: bool = False       # 四捨五入會改口數，但仍在遲滯帶內而維持現有口數
 
 
 def target_contracts(target_leverage: float, equity: float, price: float,
-                     *, multiplier: float = config.MULTIPLIER) -> SizingResult:
-    """目標口數 = round(L_target × E / (價格 × 乘數))。
+                     *, multiplier: float = config.MULTIPLIER,
+                     held: int | None = None, band: float = 0.0) -> SizingResult:
+    """目標口數 = round(L_target × E / (價格 × 乘數))，可選遲滯帶。
 
     捨入採「四捨五入（half-up）」，非 Python 內建的銀行家捨入——
     0.5 邊界行為必須確定且可測試（規格範例 1.5 口 → 2 口）。
+
+    held／band：給定現有口數 held（>0）與帶寬 band 時，raw 仍落在
+    [held − 0.5 − band, held + 0.5 + band) 就維持 held，跨出才照四捨五入重算。
+    band=0（預設）或 held 為 None／0 時與純四捨五入完全相同。是否適用
+    （同一 regime、非保險絲）由呼叫端決定，本函式不判斷。
     """
     if equity <= 0:
         raise ValueError(f"權益數異常：{equity}")
     if price <= 0:
         raise ValueError(f"價格異常：{price}")
+    if band < 0:
+        raise ValueError(f"遲滯帶寬不可為負：{band}")
     raw = target_leverage * equity / (price * multiplier)
     n = math.floor(raw + 0.5)
+    hold = (held is not None and held > 0 and band > 0 and n != held
+            and held - 0.5 - band <= raw < held + 0.5 + band)
+    if hold:
+        n = held
     return SizingResult(
         target_leverage=target_leverage, equity=equity, price=price,
         raw_contracts=raw, target_contracts=n, rounding_residual=raw - n,
-        achieved_leverage=n * price * multiplier / equity,
+        achieved_leverage=n * price * multiplier / equity, band_hold=hold,
     )
 
 
