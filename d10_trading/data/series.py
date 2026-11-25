@@ -51,6 +51,8 @@ class SignalSeries:
     warnings: list[str] = field(default_factory=list)
     cdf: pd.DataFrame | None = field(default=None, repr=False)   # 原始 TX 逐合約長表
     closures_recorded: list[dt.date] = field(default_factory=list)  # 本次查證補登的臨時停市日
+    today_contract: str | None = None # 今日暫定列所用的合約（YYYYMM）
+    today_base: float | None = None   # 該合約的前一結算價（暫定列換算基準）
 
     def settlement_of(self, contract_month: str, date: dt.date) -> float | None:
         """指定 TX 月份合約在 date 的官方結算價（FinMind）；查無回 None。
@@ -135,13 +137,25 @@ def append_official_fallback(ss: SignalSeries, date: dt.date, price: float,
     return ss
 
 
-def append_provisional(ss: SignalSeries, date: dt.date, price: float) -> SignalSeries:
-    """追加今日暫定列（13:20 即時價 ≈ 收盤），僅供今日訊號預覽。"""
+def append_provisional(ss: SignalSeries, date: dt.date, price: float, *,
+                       contract: str | None = None,
+                       base: float | None = None) -> SignalSeries:
+    """追加今日暫定列（13:20 即時價）：今日訊號的判定依據。
+
+    contract／base：今日報酬所用的合約與其前一結算價，預設為序列持倉合約。
+    """
     assert not ss.has_provisional, "暫定列只能追加一次"
-    r = price / ss.last_official_price - 1.0
+    ss.today_contract = contract or ss.held_contract
+    ss.today_base = base or ss.last_official_price
+    r = price / ss.today_base - 1.0
     ss.dates.append(date)
     ss.spot = np.append(ss.spot, ss.spot[-1] * (1.0 + r))
     return ss
+
+
+def _next_month(yyyymm: str) -> str:
+    y, m = int(yyyymm[:4]), int(yyyymm[4:])
+    return f"{y + m // 12:04d}{m % 12 + 1:02d}"
 
 
 def prepare_series(today: dt.date, *,
@@ -161,13 +175,13 @@ def prepare_series(today: dt.date, *,
         會滾動成當日結算，此時傳 False → 跳過雙源核對（避免盤後假警報）。批次固定
         13:20 執行恆為 True；遞補仍會用 reference（僅在執行時窗內具下單後果、彼時正確）。
     today_price_fn(contract_yyyymm) -> float | None
-        今日即時價（暫定列）。None → 不加暫定列（預覽略過，不影響下單）。
+        今日即時價（暫定列）。None → 不加暫定列，無法判定今日訊號（main 維持昨日槓桿）。
     contract_exists_fn(contract_yyyymm) -> bool
         該月份合約是否仍可交易。**每月結算後的 1–2 個交易日**，序列的持倉月
         已下市但 FinMind 資料尚未推進（到期判定為事後：`last_seen < data_end`），
-        此時對它查價／查參考價必然失敗。偵測到即以單一明確訊息說明，並略過
-        預覽與雙源核對——刻意不改查次月：次月與近月有月差（可達 0.3%），
-        代入會使雙源核對假性不一致，並在預覽 spot 插入假跳空而扭曲訊號。
+        此時對它查價／查參考價必然失敗。偵測到即以單一明確訊息說明，略過雙源核對，
+        今日訊號改用次月**自己的**今日報酬（即時價 ÷ 次月前一結算）——不是把次月價
+        接到近月價後面：次月與近月有月差（可達 0.3%），直接代入會插入假跳空而扭曲訊號。
     day_traded_fn(date) -> bool | None
         該日日盤是否有成交（臨時停市查證，見下方）。None → 不查證，維持原流程。
     """
@@ -203,8 +217,8 @@ def prepare_series(today: dt.date, *,
     if not held_tradable:
         ss.warnings.append(
             f"序列持倉合約 {ss.held_contract} 已結算下市，FinMind 資料尚未推進"
-            "——今日略過訊號預覽與雙源核對，待資料推進後自動恢復"
-            "（每月結算後出現一次，不影響今日執行）")
+            "——今日改用次月報酬判定訊號並略過雙源核對，待資料推進後自動恢復"
+            "（每月結算後出現一次）")
 
     # ── 行事曆 vs 實際行情日互驗（近 90 天）───────────────────────────────
     problems = calendar.validate_against_actual(
@@ -240,16 +254,25 @@ def prepare_series(today: dt.date, *,
                     f"雙源核對：{prev_td} FinMind 結算 {ss.last_official_price:.0f} vs "
                     f"Shioaji 參考價 {sj_px:.0f}，差 {diff:.3%} > {config.DUAL_SOURCE_TOL:.1%}")
 
-    # ── 今日暫定列（預覽用；序列已含今日官方列則略過）──────────────────────
-    want_preview = held_tradable and ss.last_official_date < today
-    if want_preview and today_price_fn is not None:
-        try:
-            px = today_price_fn(ss.held_contract)
-        except Exception as e:  # noqa: BLE001 - 預覽失敗不影響今日執行（T+1）
-            px = None
-            ss.warnings.append(f"今日即時價查詢失敗（{type(e).__name__}）")
+    # ── 今日暫定列（今日訊號的依據；序列已含今日官方列則略過）──────────────
+    if ss.last_official_date < today and today_price_fn is not None:
+        month, base = ss.held_contract, ss.last_official_price
+        if not held_tradable:
+            month = _next_month(ss.held_contract)
+            base = None
+            if ref_trustworthy and prev_settlement_fn is not None:
+                try:
+                    base = prev_settlement_fn(month)
+                except Exception as e:  # noqa: BLE001 - 查不到即無今日列，main 維持昨日槓桿
+                    ss.warnings.append(f"次月參考價查詢失敗（{type(e).__name__}）")
+        px = None
+        if base and base > 0:
+            try:
+                px = today_price_fn(month)
+            except Exception as e:  # noqa: BLE001 - 同上
+                ss.warnings.append(f"今日即時價查詢失敗（{type(e).__name__}）")
         if px and px > 0:
-            append_provisional(ss, today, float(px))
+            append_provisional(ss, today, float(px), contract=month, base=float(base))
         else:
-            ss.warnings.append("今日即時價無法取得，略過訊號預覽（不影響今日執行）")
+            ss.warnings.append("今日即時價無法取得，無今日暫定列")
     return ss

@@ -253,6 +253,13 @@ def _isolate_var(tmp_path, monkeypatch):
 
 
 @pytest.fixture
+def t_plus_1(monkeypatch):
+    """回退模式：第三輪規則（每 5 日檢查、T+1 執行）。回退路徑要一直有測試保護。"""
+    monkeypatch.setattr(config, "SIGNAL_CHECK_EVERY", 5)
+    monkeypatch.setattr(config, "T_PLUS_1", True)
+
+
+@pytest.fixture
 def temp_holiday_file(tmp_path, monkeypatch):
     """獨立的假日檔副本，避免測試污染 repo 內的正式檔。
 
