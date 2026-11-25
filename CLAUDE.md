@@ -17,7 +17,7 @@
 
 3. **任何動到共用層的改動，改完必跑這四組**（第五輪即以此證明引擎擴充未回歸）：
    ```bash
-   conda run -n ML_env python -m pytest d10_trading/tests -q                    # 219 項，含黃金測試（無市場資料時跳過 3 項）
+   conda run -n ML_env python -m pytest d10_trading/tests -q                    # 含黃金測試（無市場資料時跳過）
    conda run -n ML_env python -m pytest backtest_leverage_sweep/test_sweep5.py -q
    conda run -n ML_env python -m backtest_multimarket.test_engine
    conda run -n ML_env python -m backtest_ma_robustness.test_sweep

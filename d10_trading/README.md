@@ -36,7 +36,7 @@ d10_trading/
 │   ├── reconcile.py     開場對帳（不一致 → 告警停止，絕不自動修正）
 │   ├── notify.py        Telegram + 日誌
 │   └── oplog.py         每日摘要 CSV / 成交 JSONL / 執行價 vs 收盤價稽核
-├── tests/             單元 + 黃金 + 整合 + 稽核 + 監控 hook（2026-11 為 219 項）
+├── tests/             單元 + 黃金 + 整合 + 稽核 + 監控 hook
 ├── .env.example       環境變數樣板（複製為 .env，永不提交）
 └── var/               執行期產物（狀態/快取/日誌，gitignored）
 ```
@@ -208,7 +208,7 @@ Unregister-ScheduledTask D10_daily -Confirm:$false     # 移除排程
 python -m d10_trading.main --dry-run                 # 完整流程但不下單、不落地
 python -m d10_trading.main --ignore-window           # 略過 13:05–13:40 時窗（測試用）
 python -m d10_trading.main --adopt-state             # 人工確認後以 API 部位重置狀態
-python -m pytest d10_trading/tests -q                # 74 項測試（含黃金測試）
+python -m pytest d10_trading/tests -q                # 含黃金測試
 ```
 
 ## 4. 上線閘門檢核清單（🔴 每關需要使用者明確說「通過」）
