@@ -13,6 +13,20 @@ def lev(spot, **kw):
     return regime.trend_leverage(np.asarray(spot, float), **kw)
 
 
+def test_band_thresholds_match_state_machine():
+    """預覽門檻與狀態機在邊界兩側一致（今日值也計入 MA；t=405 為檢查日）。"""
+    up = 100.0 * 1.001 ** np.arange(405)
+    lo, _ = regime.band_thresholds(up)
+    assert lev(np.append(up, lo * (1 - 1e-6)))[-1] == config.L_LOW
+    assert lev(np.append(up, lo * (1 + 1e-6)))[-1] == config.L_HIGH
+
+    down = 100.0 * 0.999 ** np.arange(405)
+    assert lev(down)[-1] == config.L_LOW                     # 前提：今日之前為 BEAR
+    _, hi = regime.band_thresholds(down)
+    assert lev(np.append(down, hi * (1 + 1e-6)))[-1] == config.L_HIGH
+    assert lev(np.append(down, hi * (1 - 1e-6)))[-1] == config.L_LOW
+
+
 def test_warmup_defaults_to_bull():
     out = lev([100.0] * 50)                    # 不足 200 日：恆為 L_HIGH
     assert (out == config.L_HIGH).all()

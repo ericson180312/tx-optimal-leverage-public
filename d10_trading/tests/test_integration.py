@@ -16,7 +16,10 @@ from d10_trading.execution.broker import PositionInfo
 from d10_trading.main import run_daily
 from d10_trading.ops import state as state_mod
 from d10_trading.ops.state import PositionState, State
-from d10_trading.tests.conftest import FakeBroker, flat_quote, make_contracts, synth_cdf
+from d10_trading.strategy import regime
+from d10_trading.tests.conftest import (
+    FakeBroker, flat_quote, make_contracts, synth_cdf, trading_days,
+)
 
 START = dt.date(2025, 1, 2)
 TODAY = dt.date(2026, 7, 16)               # 週四、非結算週轉倉窗
@@ -581,6 +584,86 @@ def test_expiry_force_reuses_actual_positions(monkeypatch):
         ("Sell", "TMF202608", 1), ("Buy", "TMF202609", 1)]
     st = state_mod.load()
     assert st.positions[0].month == "202609" and st.total_qty() == 3
+
+
+# ── 訊號檢查日預覽 ───────────────────────────────────────────────────────────
+
+def _check_day() -> dt.date:
+    """合成序列在 TODAY 之後第一個 t%5==0 的交易日（首日無報酬，序列自次一交易日起算）。"""
+    d = TODAY
+    while (len(trading_days(START, d)) - 2) % config.SIGNAL_CHECK_EVERY != 0:
+        d = calendar.next_trading_day(d)
+    return d
+
+
+def _previews(sent):
+    return [(lv, t) for lv, t in sent if "今日為訊號檢查日" in t]
+
+
+def test_check_day_pushes_gate_and_stays_quiet_otherwise(monkeypatch):
+    day = _check_day()
+    broker = setup_scenario(monkeypatch, today=day)
+    sent = _capture(monkeypatch)
+    assert run(broker, today=day) == 0
+    assert broker.placed == []
+    ss = build_signal_series(synth_cdf(CONST, START, calendar.prev_trading_day(day)))
+    gate = regime.band_thresholds(ss.spot)[0] * ss.last_official_price / ss.spot[-1]
+    [(level, text)] = _previews(sent)
+    assert level == "INFO" and "目前 BULL" in text and "暫定維持 BULL" in text
+    assert f"< {gate:,.0f} 將轉 BEAR" in text
+
+    other = calendar.next_trading_day(day)                   # 非檢查日：不推
+    broker = setup_scenario(monkeypatch, today=other)
+    sent.clear()
+    assert run(broker, today=other) == 0
+    assert _previews(sent) == []
+
+
+def test_check_day_preview_flip_warns_without_trading(monkeypatch):
+    """13:20 價已越過門檻 → WARNING；但 T+1 不變，今日仍照昨日訊號、不下單。"""
+    day = _check_day()
+    crash = lambda d: 40000.0 if d >= day else 46000.0       # noqa: E731
+    broker = setup_scenario(monkeypatch, today=day, price_fn=crash, equity=608_000.0)
+    sent = _capture(monkeypatch)
+    assert run(broker, today=day) == 0
+    [(level, text)] = _previews(sent)
+    assert level == "WARNING" and "暫定轉 BEAR" in text and "L=1" in text
+    assert broker.placed == []
+    st = state_mod.load()
+    assert st.exec_leverage == config.L_HIGH and st.preview["leverage"] == config.L_LOW
+    assert any("⚠️ 1 則警示" in t for _, t in sent)
+
+
+def test_check_day_from_bear_shows_upper_gate(monkeypatch):
+    day = _check_day()
+    broker = setup_scenario(monkeypatch, today=day, price_fn=DROP_JULY,
+                            held_qty=2, state_lev=config.L_LOW)
+    sent = _capture(monkeypatch)
+    assert run(broker, today=day) == 0
+    [(level, text)] = _previews(sent)
+    assert level == "INFO" and "目前 BEAR" in text and "將轉 BULL" in text
+
+
+def test_check_day_without_today_row_skips_preview(monkeypatch):
+    """結算後過渡期或即時價取不到：無今日列，仍告知今天是檢查日。"""
+    day = _check_day()
+    ss = build_signal_series(synth_cdf(CONST, START, calendar.prev_trading_day(day)))
+    lev, _ = regime.compute_regime(ss.spot)
+    sent = _capture(monkeypatch)
+    warnings: list[str] = []
+    main_mod._check_day_notice(ss, lev, len(ss.dates) - 1, day, warnings)
+    assert sent == [("INFO", "今日為訊號檢查日｜目前 BULL｜今日無暫定價，略過預覽（不影響今日執行）")]
+    assert warnings == []
+
+
+def test_check_day_notice_failure_never_breaks_batch(monkeypatch):
+    def boom(*a, **k):
+        raise RuntimeError("preview broken")
+
+    day = _check_day()
+    broker = setup_scenario(monkeypatch, today=day)
+    monkeypatch.setattr(main_mod, "_check_day_notice", boom)
+    assert run(broker, today=day) == 0
 
 
 # ── 臨時停市偵測（2026-10-23 颱風後新增）─────────────────────────────────────

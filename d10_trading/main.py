@@ -232,6 +232,11 @@ def _run_core(broker: BrokerInterface, st, today, now, dry_run, ignore_window,
             notify.send("INFO", f"regime 切換：今日執行槓桿 {st.exec_leverage} → "
                                 f"{l_exec}（{cur_regime}）")
 
+        try:
+            _check_day_notice(ss, lev, exec_idx, today, warnings)
+        except Exception as e:  # noqa: BLE001 - 預覽通知故障不得影響交易
+            log.warning("檢查日預覽失敗（忽略）：%s", type(e).__name__)
+
         # ── 補寫前日「執行價 vs 官方結算價」稽核 ───────────────────────────
         _flush_exec_audit(st, ss)
 
@@ -605,6 +610,42 @@ def _market_closed_reason(broker: BrokerInterface, today: dt.date,
         return (f"近月 {front.code} 已 {idle:.0f} 分鐘沒有成交（最後成交 {last:%H:%M}）"
                 "——疑似盤中停市或報價中斷")
     return None
+
+
+def _check_day_notice(ss, lev, exec_idx: int, today: dt.date,
+                      warnings: list[str]) -> None:
+    """訊號檢查日推播：今日結算價到哪裡會切換 regime，以及 13:20 的暫定結果。
+
+    結算價 13:45 後才有，批次此時已結束，切換要到下一交易日 13:20 執行才會通知；
+    檢查日落在週五時，整個週末都沒有提示。門檻換算成序列持倉合約的價位，方便對照報價。
+    """
+    t = exec_idx + 1                       # 訊號日已驗證為上一交易日，今日即下一列
+    if t < config.MA_WINDOW - 1 or t % config.SIGNAL_CHECK_EVERY != 0:
+        return
+    bull = lev[exec_idx] == config.L_HIGH
+    cur, to = (regime.BULL, regime.BEAR) if bull else (regime.BEAR, regime.BULL)
+    head = f"今日為訊號檢查日｜目前 {cur}"
+    if t >= len(ss.dates):                 # 結算後過渡期或即時價取不到：無今日列
+        audit("check_day_preview", regime=cur, preview=None)
+        notify.send("INFO", f"{head}｜今日無暫定價，略過預覽（不影響今日執行）")
+        return
+
+    k = ss.last_official_price / ss.spot[ss.n_official - 1]
+    lower, upper = regime.band_thresholds(ss.spot[:t])
+    gate, now_px = (lower if bull else upper) * k, ss.spot[t] * k
+    flips = lev[t] != lev[exec_idx]
+    audit("check_day_preview", regime=cur, preview=float(lev[t]),
+          contract=ss.held_contract, price=round(now_px, 1), gate=round(gate, 1))
+    quote = f"TX {ss.held_contract} 現價 {now_px:,.0f}"
+    if flips:
+        msg = (f"{head}｜{quote} 已越過門檻 {gate:,.0f}，暫定轉 {to}｜"
+               f"以今日結算價定案，成立則下一交易日 13:20 改為 L={float(lev[t]):g}")
+        warnings.append(msg)
+        notify.send("WARNING", msg)
+    else:
+        side = "<" if bull else ">"
+        notify.send("INFO", f"{head}｜{quote}｜今日結算價 {side} {gate:,.0f} 將轉 {to}"
+                            f"（距 {gate / now_px - 1:+.1%}）｜暫定維持 {cur}")
 
 
 def _check_ca(broker: BrokerInterface) -> None:

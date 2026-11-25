@@ -48,6 +48,19 @@ def compute_regime(spot: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     return lev, lev == config.L_HIGH
 
 
+def band_thresholds(spot_before: np.ndarray, *, ma_win: int = config.MA_WINDOW,
+                    buf: float = config.BUFFER) -> tuple[float, float]:
+    """檢查日當天 spot 的切換門檻 (下緣, 上緣)；spot_before 為今日之前的序列。
+
+    今日值本身也計入 MA，不能直接用昨日的 MA×(1∓buf)：門檻解自
+    s < (1−buf)·(S + s)/N（S＝今日之前 N−1 列總和），上緣同理。
+    僅供預覽通知；訊號一律由 trend_leverage 決定，它不依賴本函式。
+    """
+    past = float(np.sum(spot_before[-(ma_win - 1):]))
+    return ((1.0 - buf) * past / (ma_win - (1.0 - buf)),
+            (1.0 + buf) * past / (ma_win - (1.0 + buf)))
+
+
 def regime_switches(dates: list[dt.date],
                     lev: np.ndarray) -> list[tuple[dt.date, str, str]]:
     """訊號槓桿序列 → (切換日, 前 regime, 後 regime) 清單。切換日=訊號日。"""
