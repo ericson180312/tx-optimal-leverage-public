@@ -145,8 +145,21 @@ def test_sync_skipped_outside_warning_window(temp_holiday_file, monkeypatch):
     called = []
     monkeypatch.setattr(holiday_sync, "fetch_twse_year",
                         lambda y: called.append(y) or {})
-    res = holiday_sync.auto_sync_if_needed(dt.date(2026, 7, 30))   # 距年底 154 天
+    res = holiday_sync.auto_sync_if_needed(dt.date(2026, 7, 30))   # 距 12/16 結算 139 天
     assert res.status == "not_needed" and called == []             # 完全不觸網
+
+
+def test_sync_window_counts_from_december_settlement(temp_holiday_file, monkeypatch):
+    """預警窗從 12 月結算日（2026-12-16）往前算，不是 12/31。
+
+    10/20 距 12/16 剩 57 天、距 12/31 剩 72 天：舊算法在此不會去查 TWSE。
+    """
+    called = []
+    monkeypatch.setattr(holiday_sync, "fetch_twse_year",
+                        lambda y: called.append(y) or {})
+    assert holiday_sync.auto_sync_if_needed(dt.date(2026, 10, 16)).status == "not_needed"
+    res = holiday_sync.auto_sync_if_needed(dt.date(2026, 10, 20))
+    assert res.status == "unavailable" and called == [2027]
 
 
 def test_sync_reports_unavailable_before_publication(temp_holiday_file, monkeypatch):

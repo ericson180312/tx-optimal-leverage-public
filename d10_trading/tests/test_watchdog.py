@@ -45,18 +45,28 @@ def test_message_wording(only_one_date):
     assert "已於" in past.message() and "逾期 3 天" in past.message()
 
 
-def test_holiday_deadline_derived_from_covered_years():
-    """假日檔期限自 covered_years 自動推導（目前檔案涵蓋到 2026）。"""
-    assert watchdog.holiday_deadline() == dt.date(2026, 12, 31)
+def test_holiday_deadline_derived_from_covered_years(temp_holiday_file):
+    """假日檔期限＝涵蓋末年 12 月合約的結算日（快照涵蓋到 2026 → 2026-12-16）。"""
+    assert watchdog.holiday_deadline() == dt.date(2026, 12, 16)
 
 
-def test_holiday_item_warns_before_year_end(monkeypatch):
+def test_holiday_item_warns_before_december_settlement(temp_holiday_file, monkeypatch):
     monkeypatch.setattr(config, "EXPIRY_DATES", {})
-    items = watchdog.check_expiries(dt.date(2026, 11, 15))    # 距 12/31 剩 46 天
+    items = watchdog.check_expiries(dt.date(2026, 11, 15))    # 距 12/16 剩 31 天
     assert len(items) == 1
     it = items[0]
     assert it.name == watchdog.HOLIDAY_ITEM and it.level == "WARNING"
-    assert "2027" in it.note and "fail-closed" in it.note
+    assert it.deadline == dt.date(2026, 12, 16) and it.days_left == 31
+    assert "202701" in it.note and "fail-closed" in it.note
+
+
+def test_holiday_item_escalates_on_settlement_countdown(temp_holiday_file, monkeypatch):
+    """ALERT 從 12/16 往前 14 天起每日推播；舊算法（12/31）此時仍只是每週一的 WARNING。"""
+    monkeypatch.setattr(config, "EXPIRY_DATES", {})
+    assert watchdog.check_expiries(dt.date(2026, 12, 1))[0].level == "WARNING"   # 15 天
+    assert watchdog.check_expiries(dt.date(2026, 12, 2))[0].level == "ALERT"     # 14 天
+    assert watchdog.check_expiries(dt.date(2026, 12, 16))[0].level == "ALERT"    # 當天仍可跑
+    assert watchdog.check_expiries(dt.date(2026, 12, 17))[0].level == "CRITICAL"
 
 
 def test_items_sorted_most_urgent_first(monkeypatch):

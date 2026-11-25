@@ -254,10 +254,20 @@ def _isolate_var(tmp_path, monkeypatch):
 
 @pytest.fixture
 def temp_holiday_file(tmp_path, monkeypatch):
-    """獨立的假日檔副本，避免測試污染 repo 內的正式檔。"""
-    src = config.HOLIDAY_FILE.read_text(encoding="utf-8")
+    """獨立的假日檔副本，避免測試污染 repo 內的正式檔。
+
+    固定為 2025–2026 的快照：正式檔每年補入次年後，依賴「涵蓋到 2026」的測試
+    （自動更新、到期期限）才不會跟著失敗。
+    """
+    keep = []
+    for line in config.HOLIDAY_FILE.read_text(encoding="utf-8").splitlines():
+        if line.startswith("# covered_years:"):
+            line = "# covered_years: 2025,2026"
+        elif line[:4].isdigit() and int(line[:4]) > 2026:
+            continue
+        keep.append(line)
     dst = tmp_path / "taifex_holidays.csv"
-    dst.write_text(src, encoding="utf-8")
+    dst.write_text("\n".join(keep) + "\n", encoding="utf-8")
     monkeypatch.setattr(config, "HOLIDAY_FILE", dst)
     calendar.reload()
     yield dst
