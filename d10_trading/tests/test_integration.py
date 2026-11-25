@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import datetime as dt
+import re
 
 from d10_trading import config
 from d10_trading import main as main_mod
@@ -709,6 +710,43 @@ def test_summary_shows_distance_to_gate(monkeypatch):
     assert "BEAR 門檻" in summary and "距 -" in summary
 
 
+def test_summary_after_flip_shows_gate_back(monkeypatch):
+    """切換當天要看轉回去的門檻，不是今天剛越過的那條（2026-11-06 實況）。"""
+    broker = setup_scenario(monkeypatch, price_fn=CRASH_TODAY, equity=EQUITY)
+    sent = _capture(monkeypatch)
+    assert run(broker) == 0
+    [summary] = [t for _, t in sent if "摘要" in t]
+    assert "BEAR L=1" in summary and "BEAR 門檻" not in summary
+    gate = float(re.search(r"BULL 門檻 ([\d,]+)（距 \+", summary).group(1).replace(",", ""))
+    # 今日列之前都是 46000，上緣解 p = 1.01 × (199 × 46000 + p) / 200
+    assert abs(gate - 1.01 * 199 * 46000 / (200 - 1.01)) < 1
+
+
+def test_summary_stays_on_actual_state_when_flip_blocked(monkeypatch):
+    """報價核對擋下切換：部位還是 BULL，摘要就還是 BEAR 門檻。"""
+    broker = setup_scenario(monkeypatch, price_fn=CRASH_TODAY, equity=EQUITY)
+    for code in [c for c in broker.quotes if c.startswith("TMF")]:
+        broker.quotes[code] = flat_quote(code, 46000.0)
+    sent = _capture(monkeypatch)
+    assert run(broker) == 0
+    [summary] = [t for _, t in sent if "摘要" in t]
+    assert "BEAR 門檻" in summary and "BULL 門檻" not in summary
+
+
+def test_summary_follows_actual_state_not_official(monkeypatch):
+    """昨日 13:20 判 BEAR、官方仍是 BULL，今日也在下緣之下：實際是 BEAR，看轉回去的門檻。"""
+    broker = setup_scenario(monkeypatch, price_fn=CRASH_TODAY, equity=800_000.0,
+                            held_qty=2, state_lev=config.L_LOW)
+    st = state_mod.load()
+    st.official_leverage = config.L_HIGH
+    state_mod.save(st)
+    sent = _capture(monkeypatch)
+    assert run(broker) == 0
+    assert state_mod.load().exec_leverage == config.L_LOW
+    [summary] = [t for _, t in sent if "摘要" in t]
+    assert "BULL 門檻" in summary and "BEAR 門檻" not in summary
+
+
 def test_wrong_1320_call_is_overridden_next_day(monkeypatch):
     """昨日 13:20 判 BEAR、結算價卻沒跌破：今日由官方狀態重算，回到 BULL 並告警。"""
     broker = setup_scenario(monkeypatch, equity=700_000.0, held_qty=2,
@@ -753,6 +791,24 @@ def test_flip_blocked_when_tx_and_tmf_disagree(monkeypatch):
     assert state_mod.load().exec_leverage == config.L_HIGH
     assert any(lv == "ALERT" and "今日不切換" in t for lv, t in sent)
     assert "flip_blocked" in _audit_events()
+    [check] = _audit_rows("flip_quote_check")
+    assert check["tmf"] == 46000.0 and check["gap"] > config.FLIP_QUOTE_TOL
+
+
+def test_flip_quote_check_recorded_when_passed(monkeypatch):
+    """通過也要留下比對值，事後才查得到當時兩邊差多少。"""
+    broker = setup_scenario(monkeypatch, price_fn=CRASH_TODAY, equity=EQUITY)
+    assert run(broker) == 0
+    assert "flip_blocked" not in _audit_events()
+    [check] = _audit_rows("flip_quote_check")
+    assert check["month"] and check["tx"] > 0 and check["tmf"] > 0
+    assert check["gap"] <= config.FLIP_QUOTE_TOL
+
+
+def test_no_flip_quote_check_without_a_flip(monkeypatch):
+    broker = setup_scenario(monkeypatch, equity=EQUITY)
+    assert run(broker) == 0
+    assert "flip_quote_check" not in _audit_events()
 
 
 def test_flip_blocked_when_tx_quote_is_stale(monkeypatch):
@@ -808,6 +864,13 @@ def _audit_events():
     if not p.exists():
         return []
     return [json.loads(x)["event"] for x in p.read_text(encoding="utf-8").splitlines()]
+
+
+def _audit_rows(event):
+    import json
+    p = config.LOG_DIR / "audit.jsonl"
+    rows = [json.loads(x) for x in p.read_text(encoding="utf-8").splitlines()]
+    return [r for r in rows if r["event"] == event]
 
 
 def test_closed_market_places_no_orders(monkeypatch):

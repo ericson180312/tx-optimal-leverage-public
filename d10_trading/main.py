@@ -390,7 +390,7 @@ def _run_core(broker: BrokerInterface, st, today, now, dry_run, ignore_window,
                     f"{today} 摘要｜{cur_regime} L={l_exec:g}｜權益 "
                     f"{recon.equity:,.0f}｜{held_qty}→{held_after} 口"
                     f"（目標 {sz.target_contracts}）｜{action_desc}"
-                    + _gate_summary(ss, lev, official_idx)
+                    + _gate_summary(ss, lev, official_idx, l_exec)
                     + (f"｜⚠️ {len(warnings)} 則警示" if warnings else ""))
         exit_code = (1 if (need_trade and not dry_run and not rep.ok)
                      else 2 if fuse_mode else 0)
@@ -657,21 +657,26 @@ def _flip_quote_problem(broker, ss, now: dt.datetime) -> str | None:
     if tx.price <= 0 or tm.price <= 0:
         return f"{month} 報價異常（大台 {tx.price:g}、微台 {tm.price:g}）"
     gap = abs(tm.price / tx.price - 1.0)
+    idle = None if tx.ts is None else (now.replace(tzinfo=None) - tx.ts).total_seconds() / 60.0
+    audit("flip_quote_check", month=month, tx=tx.price, tmf=tm.price, gap=round(gap, 6),
+          tx_idle_min=None if idle is None else round(idle, 1))
     if gap > config.FLIP_QUOTE_TOL:
         return f"大台 {tx.price:,.0f} 與微台 {tm.price:,.0f} 相差 {gap:.2%}"
-    if tx.ts is not None:
-        idle = (now.replace(tzinfo=None) - tx.ts).total_seconds() / 60.0
-        if idle > config.MARKET_STALE_MINUTES:
-            return f"大台報價已 {idle:.0f} 分鐘沒有更新"
+    if idle is not None and idle > config.MARKET_STALE_MINUTES:
+        return f"大台報價已 {idle:.0f} 分鐘沒有更新"
     return None
 
 
-def _signal_gate(ss, lev, official_idx: int) -> dict | None:
-    """今日切換門檻，換算成今日列所用合約的價位；無今日列回 None。"""
+def _signal_gate(ss, lev, official_idx: int, *, bull: bool | None = None) -> dict | None:
+    """切換門檻，換算成今日列所用合約的價位；無今日列回 None。
+
+    bull 指定從哪個狀態看，省略時用上一官方狀態，也就是今日判定實際比對的門檻。
+    """
     t = official_idx + 1
     if t >= len(ss.dates):
         return None
-    bull = lev[official_idx] == config.L_HIGH
+    if bull is None:
+        bull = lev[official_idx] == config.L_HIGH
     if ss.has_provisional:
         k = ss.today_base / ss.spot[t - 1]
         contract = ss.today_contract
@@ -684,12 +689,16 @@ def _signal_gate(ss, lev, official_idx: int) -> dict | None:
             "contract": contract}
 
 
-def _gate_summary(ss, lev, official_idx: int) -> str:
-    """當天執行時每日都是檢查日：把距切換門檻多遠併入摘要，不另發通知。"""
+def _gate_summary(ss, lev, official_idx: int, l_exec: float) -> str:
+    """當天執行時每日都是檢查日：把距切換門檻多遠併入摘要，不另發通知。
+
+    從今日實際狀態看：切換當天已是新狀態，該看的是轉回去的門檻，不是今天剛越過的那條。
+    數字用今日窗口，下一交易日窗口移一天，會略有出入。
+    """
     if config.T_PLUS_1:
         return ""
     try:
-        g = _signal_gate(ss, lev, official_idx)
+        g = _signal_gate(ss, lev, official_idx, bull=l_exec == config.L_HIGH)
     except Exception as e:  # noqa: BLE001 - 顯示用，不得影響批次
         log.warning("門檻計算失敗（忽略）：%s", type(e).__name__)
         return ""
